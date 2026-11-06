@@ -21,7 +21,6 @@
 
   class VideoDetector {
     constructor(onVideoFound, onSubtitleDetected) {
-      self = this;
       this.onVideoFound = onVideoFound;
       this.onSubtitleDetected = onSubtitleDetected;
       this.activeVideo = null;
@@ -35,21 +34,28 @@
       const observer = new MutationObserver(() => this.scanVideos());
       observer.observe(document.documentElement, { childList: true, subtree: true });
 
+      // Catch videos that start playing after initial layout
+      document.addEventListener("play", () => this.scanVideos(), true);
+      document.addEventListener("loadedmetadata", () => this.scanVideos(), true);
+      setInterval(() => this.scanVideos(), 1500);
+
       // Observe DOM subtitles
       setInterval(() => this.checkDomSubtitles(), 250);
     }
 
     scanVideos() {
-      const videos = Array.from(document.querySelectorAll("video")).filter(v => {
-        // Filter out tiny video ads or hidden elements
+      const allVideos = Array.from(document.querySelectorAll("video"));
+      if (allVideos.length === 0) return;
+
+      const videos = allVideos.filter((v) => {
         const rect = v.getBoundingClientRect();
-        return rect.width > 200 && rect.height > 100;
+        return (rect.width > 120 && rect.height > 80) || !v.paused || allVideos.length === 1;
       });
 
       if (videos.length === 0) return;
 
       // Select currently playing or largest video
-      let candidate = videos.find(v => !v.paused) || videos.sort((a, b) => {
+      const candidate = videos.find((v) => !v.paused) || videos.sort((a, b) => {
         const ra = a.getBoundingClientRect();
         const rb = b.getBoundingClientRect();
         return (rb.width * rb.height) - (ra.width * ra.height);
@@ -70,7 +76,7 @@
       if (video.textTracks) {
         const bindTrack = (track) => {
           if (!["subtitles", "captions"].includes(track.kind)) return;
-          track.mode = "hidden"; // Keep active to receive events
+          if (track.mode === "disabled") track.mode = "hidden";
           track.addEventListener("cuechange", () => {
             if (!track.activeCues || track.activeCues.length === 0) return;
             const texts = [];

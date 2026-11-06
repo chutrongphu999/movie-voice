@@ -1,5 +1,5 @@
-// Movie Voice - In-Page Web Audio Dubbing Player
-// Receives MSE audio chunks & soft subtitles, sends to Engine, and schedules dubbing playback with Smart Ducking
+// Movie Voice - In-Page Web Audio Dubbing Player v4.1
+// Receives MSE audio batches & soft subtitles, prefetches TTS audio, and schedules non-overlapping dubbing with Smart Ducking
 (function () {
   "use strict";
 
@@ -25,37 +25,64 @@
       for (const [key, val] of Object.entries(changes)) {
         config[key] = val.newValue;
       }
+      if (!config.enabled) stopAllSpeech();
       updateUI();
     });
   }
 
-  // Audio Context for low-latency playback independent of page CSP
+  // AudioContext for low-latency playback (exempt from page media-src CSP)
   let audioCtx = null;
   function getAudioContext() {
     if (!audioCtx) {
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      audioCtx = new AudioContextClass();
+      if (AudioContextClass) audioCtx = new AudioContextClass();
     }
-    if (audioCtx.state === "suspended") {
-      audioCtx.resume();
+    if (audioCtx && audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
     }
     return audioCtx;
   }
 
+  // Unlock AudioContext on any user interaction in the frame
+  ["click", "pointerdown", "keydown", "touchstart"].forEach((evt) => {
+    window.addEventListener(evt, () => getAudioContext(), { passive: true, capture: true });
+  });
+
+  function arrayBufferToBase64(buffer) {
+    let binary = "";
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    const chunkSize = 0x8000;
+    for (let i = 0; i < len; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToArrayBuffer(b64) {
+    const bin = atob(b64);
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return bytes.buffer;
+  }
+
   let activeVideo = null;
-  let savedInitChunk = null;
-  let audioChunksBuffer = [];
-  let bufferTotalBytes = 0;
-  let isUploadingChunk = false;
-  let lastUploadTime = 0;
   let cueQueue = [];
-  let currentPlayingSource = null;
+  let seenCueKeys = new Set();
+  let isSpeaking = false;
+  let currentSourceNode = null;
+  let fallbackAudioEl = new Audio();
   let isDucked = false;
   let baseVideoVolume = 1.0;
   let fadeInterval = null;
   let restoreTimeout = null;
+  let inFlightUploads = 0;
+  let pendingMseBatches = [];
 
-  // Smart Ducking: smoothly adjusts video volume
+  // Smart Ducking: smoothly lowers and restores original video volume
   function rampVideoVolume(targetVolume, durationMs = 180) {
     if (!activeVideo) return;
     if (fadeInterval) clearInterval(fadeInterval);
@@ -67,8 +94,8 @@
       return;
     }
 
-    const steps = 10;
-    const stepTime = durationMs / steps;
+    const steps = 8;
+    const stepTime = Math.max(15, durationMs / steps);
     let currentStep = 0;
 
     fadeInterval = setInterval(() => {
@@ -86,164 +113,278 @@
   }
 
   function applyDucking() {
-    if (!activeVideo || isDucked) return;
-    if (restoreTimeout) clearTimeout(restoreTimeout);
-    baseVideoVolume = activeVideo.volume > 0.05 ? activeVideo.volume : 1.0;
-    isDucked = true;
-    rampVideoVolume(baseVideoVolume * config.ducking, 150);
+    if (!activeVideo) return;
+    if (restoreTimeout) {
+      clearTimeout(restoreTimeout);
+      restoreTimeout = null;
+    }
+    if (!isDucked) {
+      baseVideoVolume = activeVideo.volume > 0.05 ? activeVideo.volume : 1.0;
+      isDucked = true;
+    }
+    rampVideoVolume(baseVideoVolume * config.ducking, 140);
   }
 
-  function restoreDucking() {
+  function restoreDucking(immediate = false) {
     if (!activeVideo || !isDucked) return;
     if (restoreTimeout) clearTimeout(restoreTimeout);
-    restoreTimeout = setTimeout(() => {
+    if (immediate) {
       isDucked = false;
-      rampVideoVolume(baseVideoVolume, 300);
+      rampVideoVolume(baseVideoVolume, 120);
+      return;
+    }
+    restoreTimeout = setTimeout(() => {
+      if (!isSpeaking) {
+        isDucked = false;
+        rampVideoVolume(baseVideoVolume, 320);
+      }
     }, 450);
   }
 
-  // Plays audio buffer through Web Audio API
-  async function playDubCue(cue) {
-    if (!config.enabled || !activeVideo || activeVideo.paused) return;
-
+  function stopAllSpeech() {
+    cueQueue = [];
+    isSpeaking = false;
+    if (currentSourceNode) {
+      try { currentSourceNode.stop(); } catch (e) {}
+      currentSourceNode = null;
+    }
     try {
-      const ctx = getAudioContext();
-      setStatus(`🎙️ ${cue.text}`);
+      fallbackAudioEl.pause();
+      fallbackAudioEl.removeAttribute("src");
+    } catch (e) {}
+    restoreDucking(true);
+  }
 
-      const audioUrl = `${ENGINE_URL}${cue.audio_url}`;
-      const resp = await fetch(audioUrl);
-      const arrayBuf = await resp.arrayBuffer();
-      const decodedBuf = await ctx.decodeAudioData(arrayBuf);
+  // Fetch voice audio bytes via background worker (or direct fetch fallback)
+  async function fetchVoiceArrayBuffer(audioUrl) {
+    if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+      const res = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: "FETCH_VOICE_AUDIO", audioUrl }, (r) => resolve(r));
+      });
+      if (res && res.ok && res.b64) {
+        return base64ToArrayBuffer(res.b64);
+      }
+    }
+    const resp = await fetch(`${ENGINE_URL}${audioUrl}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return await resp.arrayBuffer();
+  }
 
-      if (!activeVideo || activeVideo.paused) return;
+  // Enqueue cues and immediately prefetch their audio bytes
+  function enqueueCues(newCues) {
+    if (!newCues || !newCues.length) return;
+    let added = 0;
+    for (const cue of newCues) {
+      const key = `${Math.round(cue.start * 2)}:${cue.text}`;
+      if (seenCueKeys.has(key)) continue;
+      seenCueKeys.add(key);
+      if (seenCueKeys.size > 400) {
+        const firstKey = seenCueKeys.values().next().value;
+        seenCueKeys.delete(firstKey);
+      }
 
-      const sourceNode = ctx.createBufferSource();
-      sourceNode.buffer = decodedBuf;
-      sourceNode.connect(ctx.destination);
-
-      currentPlayingSource = sourceNode;
-      applyDucking();
-
-      sourceNode.onended = () => {
-        currentPlayingSource = null;
-        restoreDucking();
-        setStatus("Sẵn sàng");
-      };
-
-      sourceNode.start(0);
-    } catch (e) {
-      console.warn("[Movie Voice] Audio playback error:", e);
-      restoreDucking();
+      // Prefetch audio immediately so it's ready in memory before cue.start
+      cue.audioPromise = fetchVoiceArrayBuffer(cue.audio_url).catch((err) => {
+        console.warn("[Movie Voice] Prefetch voice failed:", err);
+        return null;
+      });
+      cueQueue.push(cue);
+      added++;
+    }
+    // Keep queue sorted by start time
+    cueQueue.sort((a, b) => a.start - b.start);
+    if (added > 0 && !isSpeaking) {
+      setStatus(`Sẵn sàng (${cueQueue.length} câu chờ đọc)`);
     }
   }
 
-  // Periodic playback queue monitor synced to video.currentTime
-  setInterval(() => {
-    if (!config.enabled || !activeVideo || activeVideo.paused || cueQueue.length === 0) return;
-
-    const currTime = activeVideo.currentTime;
-    for (let i = 0; i < cueQueue.length; i++) {
-      const cue = cueQueue[i];
-      // If cue start time is within 0.5s of current video time, trigger playback
-      if (Math.abs(currTime - cue.start) < 0.6 || (currTime >= cue.start && currTime <= cue.end)) {
-        cueQueue.splice(i, 1);
-        playDubCue(cue);
-        break;
-      }
-      // Drop cues that have expired
-      if (currTime > cue.end + 2.5) {
-        cueQueue.splice(i, 1);
-        i--;
-      }
-    }
-  }, 120);
-
-  // Send accumulated MSE audio chunks to Engine
-  async function flushMseBuffer() {
-    if (!config.enabled || isUploadingChunk || audioChunksBuffer.length === 0 || !activeVideo) return;
-    if (activeVideo.paused) return;
-    if (bufferTotalBytes < 100000) return; // Wait for at least ~100KB of audio data
-
-    // Minimum 4 seconds between requests to avoid hitting rate limits
-    const now = Date.now();
-    if (now - lastUploadTime < 4000) return;
-
-    isUploadingChunk = true;
-    lastUploadTime = now;
-
-    const chunksToSend = audioChunksBuffer.slice(0);
-    audioChunksBuffer = [];
-    bufferTotalBytes = 0;
-
-    // Check if the stream starts with init box (ftyp). If not and we have savedInitChunk, prepend it!
-    let parts = chunksToSend.slice(0);
-    if (savedInitChunk && parts.length > 0) {
-      const first = new Uint8Array(parts[0]);
-      const hasFtyp = first.length > 8 && first[4] === 0x66 && first[5] === 0x74 && first[6] === 0x79 && first[7] === 0x70;
-      if (!hasFtyp) {
-        parts.unshift(savedInitChunk);
-      }
-    }
-
-    const totalLen = parts.reduce((acc, c) => acc + c.byteLength, 0);
-    const merged = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const c of parts) {
-      merged.set(new Uint8Array(c), offset);
-      offset += c.byteLength;
-    }
-
-    const timeOffset = Math.max(0, activeVideo.currentTime - 1.0);
-    const formData = new FormData();
-    formData.append("file", new Blob([merged], { type: "audio/mp4" }), "stream.mp4");
-    formData.append("time_offset", String(timeOffset));
-    formData.append("voice", config.voice);
-    formData.append("rate", String(config.rate));
-    formData.append("pitch", String(config.pitch));
-
-    setStatus("⚡ Đang nhận diện...");
+  // Play a single cue using Web Audio API (with HTML5 Audio fallback)
+  async function playCueNow(cue, playbackRate = 1.0) {
+    if (!config.enabled || !activeVideo || activeVideo.paused) return;
+    isSpeaking = true;
 
     try {
-      const resp = await fetch(`${ENGINE_URL}/api/dub/audio`, {
-        method: "POST",
-        body: formData
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data.cues && data.cues.length > 0) {
-          for (const cue of data.cues) {
-            cueQueue.push(cue);
-          }
-          setStatus(`Đã nạp ${data.cues.length} câu`);
-        } else {
-          setStatus("Đang phát phim");
+      const arrayBuf = await (cue.audioPromise || fetchVoiceArrayBuffer(cue.audio_url));
+      if (!arrayBuf || !config.enabled || !activeVideo || activeVideo.paused) {
+        isSpeaking = false;
+        return;
+      }
+
+      setStatus(`🎙️ ${cue.text}`);
+      applyDucking();
+
+      const ctx = getAudioContext();
+      if (ctx && ctx.state === "running") {
+        const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
+        await new Promise((resolve) => {
+          const source = ctx.createBufferSource();
+          source.buffer = decoded;
+          source.playbackRate.value = playbackRate;
+          source.connect(ctx.destination);
+          currentSourceNode = source;
+          source.onended = () => {
+            currentSourceNode = null;
+            resolve();
+          };
+          source.start(0);
+        });
+      } else {
+        // Fallback to HTML5 Audio element if AudioContext is still suspended
+        const blob = new Blob([arrayBuf], { type: "audio/mpeg" });
+        const blobUrl = URL.createObjectURL(blob);
+        try {
+          await new Promise((resolve, reject) => {
+            fallbackAudioEl.src = blobUrl;
+            fallbackAudioEl.playbackRate = playbackRate;
+            fallbackAudioEl.onended = () => resolve();
+            fallbackAudioEl.onerror = (e) => reject(e);
+            fallbackAudioEl.play().catch(reject);
+          });
+        } finally {
+          URL.revokeObjectURL(blobUrl);
         }
       }
     } catch (err) {
-      // Ignore network blip
+      if (err && err.name === "NotAllowedError") {
+        setStatus("🔊 Bấm vào khung video để cho phép âm thanh");
+      } else {
+        console.warn("[Movie Voice] Playback error:", err);
+      }
     } finally {
-      isUploadingChunk = false;
+      isSpeaking = false;
+      restoreDucking(false);
     }
   }
 
-  // Receive MSE chunks from MAIN world mse-hook.js
-  window.addEventListener("message", (event) => {
-    if (event.data && event.data.type === "__MOVIE_VOICE_MSE_CHUNK__" && event.data.buffer) {
-      if (!event.data.isAudio) return;
+  // Scheduler loop: checks cueQueue every 100ms and plays lines sequentially
+  setInterval(() => {
+    if (!config.enabled || !activeVideo || activeVideo.paused || isSpeaking || cueQueue.length === 0) {
+      return;
+    }
 
-      if (event.data.isInit) {
-        savedInitChunk = event.data.buffer.slice(0);
+    const currTime = activeVideo.currentTime;
+
+    // 1. Drop cues that are too old (ended more than 7s ago) or way in the past after a seek
+    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 7.0) {
+      cueQueue.shift();
+    }
+    if (cueQueue.length === 0) return;
+
+    const nextCue = cueQueue[0];
+
+    // 2. If the next cue is due now (or arrived slightly late within the 7s grace window), play it!
+    if (currTime >= nextCue.start - 0.25) {
+      cueQueue.shift();
+      // Speed up slightly if we are catching up or if more cues are waiting right behind
+      let speed = 1.0 + (config.rate || 0) / 100;
+      const lag = currTime - nextCue.start;
+      if (lag > 1.5 || cueQueue.length >= 2) {
+        speed = Math.min(1.28, Math.max(speed, 1.15));
+      }
+      playCueNow(nextCue, Math.max(0.8, Math.min(1.35, speed)));
+    }
+  }, 100);
+
+  // Send MSE batch to Engine via background worker (or direct fetch fallback)
+  async function processNextMseBatch() {
+    if (!config.enabled || inFlightUploads >= 2 || pendingMseBatches.length === 0) return;
+
+    const batch = pendingMseBatches.shift();
+    // If activeVideo has already moved far past this batch, skip it
+    if (activeVideo && activeVideo.currentTime > batch.endTime + 6.0 && batch.endTime > 0) {
+      return;
+    }
+
+    inFlightUploads++;
+    if (!isSpeaking) {
+      setStatus(`⚡ Đang dịch đoạn ${Math.floor(batch.startTime)}s...`);
+    }
+
+    try {
+      let cues = [];
+      if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+        const b64 = arrayBufferToBase64(batch.buffer);
+        const res = await new Promise((resolve) => {
+          chrome.runtime.sendMessage(
+            {
+              type: "DUB_AUDIO_B64",
+              audioB64: b64,
+              mimeType: batch.mimeType || "audio/mp4",
+              timeOffset: batch.startTime || 0,
+              voice: config.voice,
+              rate: config.rate,
+              pitch: config.pitch
+            },
+            (r) => resolve(r)
+          );
+        });
+        if (res && res.ok) {
+          cues = res.cues || [];
+        } else if (res && res.error && !isSpeaking) {
+          setStatus(`Lỗi Engine: ${res.error.slice(0, 45)}`);
+        }
+      } else {
+        const formData = new FormData();
+        formData.append("file", new Blob([batch.buffer], { type: batch.mimeType || "audio/mp4" }), "stream.mp4");
+        formData.append("time_offset", String(batch.startTime || 0));
+        formData.append("voice", config.voice);
+        formData.append("rate", String(config.rate));
+        formData.append("pitch", String(config.pitch));
+
+        const resp = await fetch(`${ENGINE_URL}/api/dub/audio`, {
+          method: "POST",
+          body: formData
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          cues = data.cues || [];
+        }
       }
 
-      audioChunksBuffer.push(event.data.buffer);
-      bufferTotalBytes += event.data.byteLength;
-
-      // When ~250KB of audio data has buffered, trigger flush
-      if (bufferTotalBytes >= 250000) {
-        flushMseBuffer();
+      if (cues.length > 0) {
+        enqueueCues(cues);
+      } else if (!isSpeaking && cueQueue.length === 0) {
+        setStatus("Đang lắng nghe thoại...");
+      }
+    } catch (err) {
+      if (!isSpeaking) setStatus("Chưa kết nối Engine (run.bat)");
+    } finally {
+      inFlightUploads--;
+      if (pendingMseBatches.length > 0) {
+        processNextMseBatch();
       }
     }
+  }
+
+  // Listen for MSE audio batches from mse-hook.js
+  window.addEventListener("message", (event) => {
+    if (!event.data || event.data.type !== "__MOVIE_VOICE_MSE_BATCH__" || !event.data.buffer) {
+      return;
+    }
+    const startTime = Number.isFinite(event.data.startTime)
+      ? event.data.startTime
+      : (activeVideo ? activeVideo.currentTime : 0);
+    const endTime = Number.isFinite(event.data.endTime)
+      ? event.data.endTime
+      : (startTime + 6.0);
+
+    pendingMseBatches.push({
+      mimeType: event.data.mimeType,
+      startTime,
+      endTime,
+      buffer: event.data.buffer
+    });
+
+    // Keep queue bounded
+    if (pendingMseBatches.length > 8) {
+      pendingMseBatches.shift();
+    }
+
+    processNextMseBatch();
   });
+
+  // Notify mse-hook.js that dub-player.js is ready to receive batches
+  window.postMessage({ type: "__MOVIE_VOICE_PLAYER_READY__" }, "*");
 
   // UI elements
   let uiContainer = null;
@@ -252,6 +393,7 @@
   function setStatus(text) {
     if (statusTextEl) {
       statusTextEl.innerText = text;
+      statusTextEl.title = text;
     }
   }
 
@@ -273,11 +415,12 @@
       <span class="mv-status-text">Sẵn sàng</span>
     `;
 
-    uiContainer.querySelector(".mv-toggle-btn").addEventListener("click", () => {
+    uiContainer.querySelector(".mv-toggle-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      getAudioContext();
       config.enabled = !config.enabled;
-      if (!config.enabled && currentPlayingSource) {
-        try { currentPlayingSource.stop(); } catch (e) {}
-        restoreDucking();
+      if (!config.enabled) {
+        stopAllSpeech();
       }
       if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.sync) {
         chrome.storage.sync.set({ enabled: config.enabled });
@@ -295,39 +438,65 @@
     setStatus("Sẵn sàng");
   }
 
+  function bindVideoEvents(video) {
+    if (video.__mvDubEvents) return;
+    video.__mvDubEvents = true;
+
+    video.addEventListener("play", () => {
+      getAudioContext();
+    });
+
+    video.addEventListener("pause", () => {
+      if (video === activeVideo && currentSourceNode) {
+        try { currentSourceNode.stop(); } catch (e) {}
+      }
+      restoreDucking(true);
+    });
+
+    video.addEventListener("seeking", () => {
+      if (video === activeVideo) {
+        stopAllSpeech();
+        setStatus("Đang đồng bộ vị trí mới...");
+      }
+    });
+  }
+
   // Initialize detector
   new window.MovieVoiceDetector(
     (video) => {
       activeVideo = video;
+      bindVideoEvents(video);
       mountUI(video);
+      // Re-signal ready in case video was dynamically created
+      window.postMessage({ type: "__MOVIE_VOICE_PLAYER_READY__" }, "*");
     },
     async (sub) => {
       // Soft subtitle detected
       if (!config.enabled || !activeVideo) return;
+      const payload = {
+        cues: [{ start: sub.start, end: sub.end, text: sub.text }],
+        voice: config.voice,
+        rate: config.rate,
+        pitch: config.pitch,
+        is_vietnamese: true
+      };
       try {
-        const resp = await fetch(`${ENGINE_URL}/api/dub/subtitles`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            cues: [{ start: sub.start, end: sub.end, text: sub.text }],
-            voice: config.voice,
-            rate: config.rate,
-            pitch: config.pitch,
-            is_vietnamese: true
-          })
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          if (data.cues && data.cues.length > 0) {
-            for (const c of data.cues) {
-              cueQueue.push(c);
-            }
+        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+          chrome.runtime.sendMessage({ type: "DUB_SUBTITLES", payload }, (res) => {
+            if (res && res.ok && res.cues) enqueueCues(res.cues);
+          });
+        } else {
+          const resp = await fetch(`${ENGINE_URL}/api/dub/subtitles`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            if (data.cues) enqueueCues(data.cues);
           }
         }
       } catch (e) {}
     }
   );
-
-  // Periodically flush buffer every 5s if new chunks exist
-  setInterval(flushMseBuffer, 5000);
 })();
