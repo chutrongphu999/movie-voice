@@ -92,6 +92,52 @@
   let inFlightUploads = 0;
   let pendingMseBatches = [];
 
+  // Dub-ahead gating: pause video briefly so the AI stays ~12s ahead of the playhead (no more lag / stale cues)
+  let processedUpTo = 0;
+  let gateWindowStart = Date.now();
+  let autoPaused = false;
+  let autoPauseStartedAt = 0;
+  let lastGateEndedAt = 0;
+  const GATE_MIN_AHEAD = 5.0;
+  const GATE_RESUME_AHEAD = 12.0;
+
+  function resetGate(time) {
+    processedUpTo = time || 0;
+    gateWindowStart = Date.now();
+  }
+
+  setInterval(() => {
+    if (!config.enabled || !activeVideo) return;
+    const t = activeVideo.currentTime;
+    const ahead = processedUpTo - t;
+    const gateActive = (Date.now() - gateWindowStart) < 40000;
+
+    if (autoPaused) {
+      const waited = Date.now() - autoPauseStartedAt;
+      if (ahead >= GATE_RESUME_AHEAD || waited > 25000 || !gateActive) {
+        autoPaused = false;
+        lastGateEndedAt = Date.now();
+        sendClientLog("GATE_RESUME", `ahead=${ahead.toFixed(1)}s waited=${(waited / 1000).toFixed(1)}s`);
+        activeVideo.play().catch(() => {});
+      } else {
+        setStatus(`⏳ Đang chuẩn bị lồng tiếng... (${Math.max(0, ahead).toFixed(0)}/${GATE_RESUME_AHEAD}s)`);
+      }
+      return;
+    }
+
+    if (
+      !activeVideo.paused &&
+      gateActive &&
+      ahead < GATE_MIN_AHEAD &&
+      Date.now() - lastGateEndedAt > 3000
+    ) {
+      autoPaused = true;
+      autoPauseStartedAt = Date.now();
+      activeVideo.pause();
+      sendClientLog("GATE_PAUSE", `video=${t.toFixed(1)}s processedUpTo=${processedUpTo.toFixed(1)}s`);
+    }
+  }, 300);
+
   // Smart Ducking: smoothly lowers and restores original video volume
   function rampVideoVolume(targetVolume, durationMs = 180) {
     if (!activeVideo) return;
@@ -299,7 +345,7 @@
     // 1. Drop cues that have already passed (> 0.8s past cue.end or > 2.8s past cue.start) so we NEVER speak stale lines!
     while (
       cueQueue.length > 0 &&
-      (currTime > cueQueue[0].end + 0.8 || currTime > cueQueue[0].start + 2.8)
+      (currTime > cueQueue[0].end + 1.0 || currTime > cueQueue[0].start + 3.5)
     ) {
       const dropped = cueQueue.shift();
       sendClientLog("CUE_SKIPPED_LATE", `Skipped stale ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s at video=${currTime.toFixed(1)}s`);
@@ -424,6 +470,9 @@
       if (!isSpeaking) setStatus("Chưa kết nối Engine (run.bat)");
     } finally {
       inFlightUploads--;
+      if (batch && Number.isFinite(batch.endTime)) {
+        processedUpTo = Math.max(processedUpTo, batch.endTime);
+      }
       if (pendingMseBatches.length > 0) {
         processNextMseBatch();
       }
@@ -531,13 +580,25 @@
 
     video.addEventListener("pause", () => {
       if (video === activeVideo) {
-        stopCurrentSpeechOnly();
+        // Only the user's own pause stops speech; our gate pause keeps queued cues intact
+        if (!autoPaused) stopCurrentSpeechOnly();
+      }
+    });
+
+    video.addEventListener("play", () => {
+      // User pressed play manually while gate was holding: release gate
+      if (video === activeVideo && autoPaused && Date.now() - autoPauseStartedAt > 800) {
+        autoPaused = false;
+        lastGateEndedAt = Date.now();
       }
     });
 
     video.addEventListener("seeking", () => {
       if (video === activeVideo) {
         stopCurrentSpeechOnly();
+        cueQueue = [];
+        autoPaused = false;
+        resetGate(video.currentTime);
         setStatus("Đang đồng bộ vị trí mới...");
       }
     });
@@ -554,6 +615,7 @@
   new window.MovieVoiceDetector(
     (video) => {
       activeVideo = video;
+      resetGate(video.currentTime || 0);
       bindVideoEvents(video);
       mountUI(video);
       sendClientLog("VIDEO_DETECTED", `duration=${(video.duration || 0).toFixed(1)}s, currentTime=${(video.currentTime || 0).toFixed(1)}s`);
