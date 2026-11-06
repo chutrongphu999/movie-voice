@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Movie Voice Settings</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <div class="title-group">
+      <div class="logo">🎬</div>
+      <h2>Movie Voice</h2>
+    </div>
+    <div id="statusBadge" class="status-badge connecting">Đang kết nối...</div>
+  </div>
+
+  <div class="card">
+    <div class="setting-row">
+      <span>Bật lồng tiếng AI</span>
+      <label class="switch">
+        <input type="checkbox" id="toggleEnabled" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="setting-group">
+      <label for="selectVoice">Giọng lồng tiếng</label>
+      <select id="selectVoice">
+        <option value="vi-VN-HoaiMyNeural">Hoài My (Nữ tự nhiên)</option>
+        <option value="vi-VN-NamMinhNeural">Nam Minh (Nam truyền cảm)</option>
+      </select>
+    </div>
+
+    <div class="setting-group">
+      <div class="label-with-val">
+        <label for="sliderDucking">Âm lượng phim khi nói (Ducking)</label>
+        <span id="duckingVal">20%</span>
+      </div>
+      <input type="range" id="sliderDucking" min="5" max="50" step="5" value="20">
+    </div>
+
+    <div class="setting-group">
+      <div class="label-with-val">
+        <label for="sliderRate">Tốc độ đọc</label>
+        <span id="rateVal">0%</span>
+      </div>
+      <input type="range" id="sliderRate" min="-20" max="40" step="5" value="0">
+    </div>
+  </div>
+
+  <div class="actions">
+    <button id="btnTestVoice" class="btn-secondary">🔊 Nghe thử giọng</button>
+  </div>
+
+  <div class="footer">
+    Server: <code>http://127.0.0.1:8765</code>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

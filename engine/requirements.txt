@@ -5,3 +5,4 @@ edge-tts>=7.0.0
 imageio-ffmpeg>=0.5.1
 groq>=0.13.0
 python-dotenv>=1.0.0
+python-multipart>=0.0.20
