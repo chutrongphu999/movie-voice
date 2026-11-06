@@ -49,7 +49,8 @@ class Translator:
             "1. Dịch thoát ý, tự nhiên như người Việt nói chuyện ngoài đời, ngắn gọn vừa khít khẩu hình và thời lượng câu thoại.\n"
             "2. Tuyệt đối KHÔNG dịch word-by-word ngô nghê (ví dụ: 'Look,' ở đầu câu phải dịch là 'Nghe này,' hoặc 'Nhìn xem,'; 'National Guard' là 'Vệ binh Quốc gia'; 'What's wrong with you?' là 'Cậu bị làm sao thế?').\n"
             "3. Giữ mạch xưng hô nhất quán với các câu trước đó trong phần <context>.\n"
-            "4. Bắt buộc giữ nguyên số lượng dòng và mã số #1, #2... tương ứng. Chỉ trả về đúng định dạng:\n"
+            "4. Lời thoại gốc do máy nhận dạng giọng nói tạo ra nên có thể sai chính tả/từ đồng âm; hãy suy luận theo ngữ cảnh phim để dịch câu hợp lý nhất. Tên riêng, tên phe phái giữ nguyên, không dịch nghĩa đen.\n"
+            "5. Bắt buộc giữ nguyên số lượng dòng và mã số #1, #2... tương ứng. Chỉ trả về đúng định dạng:\n"
             "#{số thứ tự} Translation> {câu thoại tiếng Việt}\n\n"
         )
         if context_hint:

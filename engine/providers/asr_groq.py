@@ -52,8 +52,8 @@ HALLUCINATION_EXACT = {
 }
 
 ASR_MODELS = [
-    "whisper-large-v3-turbo",
     "whisper-large-v3",
+    "whisper-large-v3-turbo",
 ]
 
 
@@ -194,20 +194,25 @@ class GroqASR:
 
         # Skip silent / low-energy chunks before calling Whisper API
         rms = compute_pcm_rms(wav_bytes)
-        if rms < 75.0:
+        if rms < 40.0:
             return []
 
         result = None
+        language = os.getenv("ASR_LANGUAGE", "en").strip().lower()
         for attempt in range(3):
             chosen_model = ASR_MODELS[(self._model_idx + attempt) % len(ASR_MODELS)]
             try:
                 def _call_groq(m=chosen_model):
-                    return self.client.audio.transcriptions.create(
+                    kwargs = dict(
                         file=("chunk.wav", wav_bytes),
                         model=m,
                         response_format="verbose_json",
-                        temperature=0.0
+                        temperature=0.0,
                     )
+                    # Locking the language stops Whisper from mis-detecting it on music/SFX and producing gibberish
+                    if language and language != "auto":
+                        kwargs["language"] = language
+                    return self.client.audio.transcriptions.create(**kwargs)
                 result = await asyncio.to_thread(_call_groq)
                 self._model_idx = (self._model_idx + 1) % len(ASR_MODELS)
                 break
@@ -251,15 +256,24 @@ class GroqASR:
                 seg.get("compression_ratio", 1.0) if is_dict else getattr(seg, "compression_ratio", 1.0)
             )
 
-            # Strict Whisper quality & anti-hallucination thresholds
-            if no_speech_prob > 0.55 or avg_logprob < -1.05 or compression_ratio > 2.15:
-                continue
-            if start >= wav_duration - 0.15:
+            # Standard Whisper rule: silence only if BOTH no_speech is high AND confidence is low.
+            # (The previous OR-based thresholds dropped a lot of real dialogue.)
+            reason = None
+            if no_speech_prob > 0.6 and avg_logprob < -1.0:
+                reason = f"no_speech={no_speech_prob:.2f} logprob={avg_logprob:.2f}"
+            elif avg_logprob < -1.6:
+                reason = f"logprob={avg_logprob:.2f}"
+            elif compression_ratio > 2.4:
+                reason = f"compress={compression_ratio:.2f}"
+            elif start >= wav_duration - 0.15:
+                reason = "past-end"
+            if reason:
+                print(f"[ASR] drop ({reason}): {text[:50]}")
                 continue
 
             end = min(end, wav_duration + 0.2)
             seg_dur = end - start
-            if not text or seg_dur < 0.25:
+            if not text or seg_dur < 0.2:
                 continue
 
             norm = text.lower()
@@ -270,6 +284,7 @@ class GroqASR:
                 continue
 
             if is_hallucination_text(text, seg_dur):
+                print(f"[ASR] drop (hallucination): {text[:50]}")
                 continue
 
             prev_norm = norm
