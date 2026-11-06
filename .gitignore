@@ -1,0 +1,15 @@
+server/.venv/
+__pycache__/
+*.pyc
+*.log
+test/voice_sample.mp3
+server/ocr/node_modules/
+server/webdeps/node_modules/
+server/.cache/
+server/.local-settings.json
+server/.local-settings.tmp
+test/ocr_crop.png
+test/piper_sample.wav
+server/models/*.onnx
+server/models/*.onnx.json
+server/models/*.traineddata

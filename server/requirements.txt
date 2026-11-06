@@ -1,0 +1,7 @@
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+edge-tts>=7,<8
+Pillow>=10,<13
+aiohttp>=3.10,<4
+imageio-ffmpeg==0.8.1
+piper-tts==1.8.0

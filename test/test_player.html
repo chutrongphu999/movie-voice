@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Test Studio - Movie Voiceover Pro</title>
+  <style>
+    body {
+      background: #0f172a;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 30px 20px;
+    }
+    h1 {
+      margin-bottom: 8px;
+      color: #38bdf8;
+    }
+    p {
+      color: #94a3b8;
+      margin-bottom: 20px;
+      text-align: center;
+      max-width: 650px;
+      line-height: 1.5;
+    }
+    .video-container {
+      position: relative;
+      width: 760px;
+      height: 428px;
+      max-width: 100%;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 12px 36px rgba(0,0,0,0.6);
+      border: 1px solid #334155;
+      background: #000;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .art-subtitle {
+      position: absolute;
+      bottom: 34px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.78);
+      color: #facc15;
+      padding: 8px 18px;
+      border-radius: 8px;
+      font-size: 19px;
+      font-weight: 700;
+      text-align: center;
+      width: 86%;
+      z-index: 10;
+      display: none;
+      text-shadow: 0 2px 4px rgba(0,0,0,0.9);
+    }
+    .controls {
+      margin-top: 18px;
+      display: flex;
+      gap: 12px;
+    }
+    .btn {
+      background: linear-gradient(135deg, #0284c7, #2563eb);
+      color: white;
+      border: none;
+      padding: 11px 22px;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-secondary {
+      background: #334155;
+    }
+    .instructions {
+      margin-top: 24px;
+      background: #1e293b;
+      padding: 16px 22px;
+      border-radius: 10px;
+      max-width: 760px;
+      width: 100%;
+      font-size: 14px;
+      line-height: 1.65;
+      border: 1px solid #334155;
+    }
+    .instructions code {
+      background: #334155;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #38bdf8;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎬 Phòng Thử Nghiệm Movie Voiceover Pro</h1>
+  <p>Bản nâng cấp với bộ giọng <strong>Review Phim Kịch Tính & Kể Chuyện Đêm Khuya</strong>, kết hợp bộ trộn âm Studio (Smooth Fade Ducking).</p>
+
+  <div class="video-container">
+    <video id="demoVideo" playsinline autoplay></video>
+    <div id="subtitleBox" class="art-subtitle"></div>
+  </div>
+
+  <div class="controls">
+    <button class="btn" id="btnStart">▶️ Bắt đầu chiếu thử phong cách Review Phim</button>
+    <button class="btn btn-secondary" id="btnStop">⏹️ Dừng</button>
+  </div>
+
+  <div class="instructions">
+    <strong>✨ Cách đổi giọng Review Phim / Kể Chuyện:</strong>
+    <ol style="margin-left: 20px; margin-top: 8px;">
+      <li>Bấm vào <strong>biểu tượng Extension 🎬</strong> ở góc trên bên phải trình duyệt Chrome.</li>
+      <li>Tại mục <strong>"🎭 Phong cách giọng đọc (Preset)"</strong>, chọn thử:
+        <ul>
+          <li><code>🔥 Review Phim Kịch Tính (Nam)</code>: Giọng trầm, nhịp nhanh dứt khoát.</li>
+          <li><code>✨ Review Phim Cuốn Hút (Nữ)</code>: Giọng sắc nét, lôi cuốn.</li>
+          <li><code>📖 Kể Chuyện Trầm Ấm</code> hoặc <code>🌙 Kể Chuyện Đêm Khuya</code>: Nhịp sâu lắng, truyền cảm.</li>
+        </ul>
+      </li>
+      <li>Bạn cũng có thể kéo thanh <strong>Độ trầm ấm (Pitch)</strong> và <strong>Tốc độ</strong> để hợp gu nghe của bạn nhất!</li>
+    </ol>
+  </div>
+
+  <script>
+    const video = document.getElementById("demoVideo");
+    const subBox = document.getElementById("subtitleBox");
+    const btnStart = document.getElementById("btnStart");
+    const btnStop = document.getElementById("btnStop");
+
+    const canvas = document.createElement("canvas");
+    canvas.width = 760;
+    canvas.height = 428;
+    const ctx = canvas.getContext("2d");
+
+    let animationId = null;
+    let timerId = null;
+    let seconds = 0;
+
+    // Kịch bản câu thoại mang đậm màu sắc Review Phim & Kể Chuyện
+    const testSubtitles = [
+      "Người đàn ông này không hề biết rằng, cánh cửa trước mặt sẽ dẫn anh vào một bí mật động trời.",
+      "Tất cả mọi người trong căn phòng đều nín thở, không ai dám tin vào những gì vừa xuất hiện trên màn hình.",
+      "Hóa ra bấy lâu nay, kẻ đứng sau thao túng toàn bộ cuộc chơi, lại chính là người bạn thân nhất của anh.",
+      "Giữa đêm mưa tầm tã, cô gái lặng lẽ quay lưng bước đi, để lại phía sau tất cả những lời hứa năm xưa.",
+      "Bộ phim khép lại, nhưng dư âm của nó chắc chắn sẽ khiến chúng ta phải suy ngẫm thật lâu."
+    ];
+
+    function drawFrame() {
+      const hue = (seconds * 15) % 360;
+      ctx.fillStyle = `hsl(${hue}, 38%, 14%)`;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.fillStyle = "#38bdf8";
+      ctx.font = "bold 26px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("🎬 MOVIE VOICEOVER PRO - STUDIO TEST", canvas.width / 2, 145);
+
+      ctx.fillStyle = "#e2e8f0";
+      ctx.font = "18px sans-serif";
+      ctx.fillText(`Âm lượng video hiện tại: ${Math.round(video.volume * 100)}% (Tự động hạ mượt khi đọc)`, canvas.width / 2, 195);
+
+      // Thanh biểu diễn mức âm lượng phim trực quan
+      const barW = 320;
+      const barH = 12;
+      const barX = (canvas.width - barW) / 2;
+      const barY = 215;
+      ctx.fillStyle = "#334155";
+      ctx.fillRect(barX, barY, barW, barH);
+      ctx.fillStyle = "#22c55e";
+      ctx.fillRect(barX, barY, barW * video.volume, barH);
+
+      // Sub cứng vẽ trực tiếp lên canvas (để test cả chế độ OCR nếu bật)
+      if (subBox.innerText) {
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(90, 340, canvas.width - 180, 48);
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 17px sans-serif";
+        ctx.fillText(subBox.innerText, canvas.width / 2, 370);
+      }
+
+      animationId = requestAnimationFrame(drawFrame);
+    }
+
+    function startTest() {
+      const stream = canvas.captureStream(30);
+      video.srcObject = stream;
+      video.volume = 1.0;
+      video.play();
+      drawFrame();
+
+      btnStart.disabled = true;
+      btnStart.textContent = "🎬 Đang phát thử nghiệm...";
+      seconds = 0;
+
+      let subIndex = 0;
+      // Hiển thị câu đầu tiên ngay giây thứ 1
+      setTimeout(() => {
+        subBox.style.display = "block";
+        subBox.innerText = testSubtitles[0];
+        subIndex = 1;
+      }, 600);
+
+      timerId = setInterval(() => {
+        seconds += 1;
+        if (seconds % 7 === 0) {
+          if (subIndex >= testSubtitles.length) subIndex = 0;
+          subBox.style.display = "block";
+          subBox.innerText = testSubtitles[subIndex];
+          subIndex++;
+        } else if (seconds % 7 === 6) {
+          subBox.style.display = "none";
+          subBox.innerText = "";
+        }
+      }, 1000);
+    }
+
+    function stopTest() {
+      clearInterval(timerId);
+      cancelAnimationFrame(animationId);
+      subBox.style.display = "none";
+      subBox.innerText = "";
+      btnStart.disabled = false;
+      btnStart.textContent = "▶️ Bắt đầu chiếu thử phong cách Review Phim";
+    }
+
+    btnStart.addEventListener("click", startTest);
+    btnStop.addEventListener("click", stopTest);
+  </script>
+</body>
+</html>

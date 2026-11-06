@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="vi">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Movie Voice · Xem phim cùng nhau</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<header><a class="brand" href="/player/">◉ <b>Movie Voice</b></a><span class="tag">Hình và giọng trên cùng timeline</span><button id="settingsButton" class="quiet">Cài đặt Gemini</button></header>
+<main>
+  <section id="setup" class="card setup">
+    <div class="eyebrow">PHÒNG CHIẾU CỦA BẠN</div>
+    <h1>Xem phim. Nghe tiếng Việt.</h1>
+    <p class="muted">Chuẩn bị lời đọc trước, ghép vào phim rồi mới phát. Cả hai người cùng nghe khi chia sẻ tab qua Google Meet.</p>
+    <form id="startForm">
+      <label for="source">Link phim trực tiếp · MP4 hoặc HLS</label>
+      <input id="source" type="url" placeholder="https://…/index.m3u8" autocomplete="off">
+      <div class="file-row"><label class="file-button">Hoặc chọn video trên máy<input id="videoFile" type="file" accept="video/*,.mkv,.mov" hidden></label><span id="fileName" class="muted">Chưa chọn file</span></div>
+      <div class="columns"><div><label for="title">Tên phim</label><input id="title" maxlength="200" value="Phim của bạn"></div><div><label for="startAt">Bắt đầu tại (phút:giây)</label><input id="startAt" value="00:00" inputmode="numeric" pattern="\d+:\d{2}"></div></div>
+      <details><summary>Có sẵn phụ đề tiếng Việt? Dùng để tạo giọng chính xác hơn.</summary>
+        <label class="file-button">Chọn SRT hoặc VTT<input id="subtitleFile" type="file" accept=".srt,.vtt" hidden></label><span id="subtitleName" class="muted"></span>
+        <label class="check"><input id="vietnamese" type="checkbox">Tôi xác nhận phụ đề này là tiếng Việt và khớp bản phim.</label>
+      </details>
+      <div class="columns"><div><label for="provider">Giọng đọc</label><select id="provider"><option value="local">Tiếng Việt cục bộ · không tốn quota giọng</option><option value="gemini">Gemini · cần đủ hạn mức TTS</option><option value="edge">Edge · thử nghiệm</option></select></div><div><label for="ducking">Âm lượng tiếng gốc lúc có lời Việt</label><select id="ducking"><option value="0.18">18% · nghe rõ thuyết minh</option><option value="0.35">35% · giữ nhiều tiếng gốc</option><option value="0">Tắt tiếng gốc lúc có lời Việt</option></select></div></div>
+      <p id="keyNote" class="note">Đang kiểm tra kết nối…</p>
+      <button id="startButton" class="primary" type="submit">Chuẩn bị & mở phim</button>
+      <p id="setupError" class="error" role="alert"></p>
+    </form>
+  </section>
+  <section id="watch" hidden>
+    <div class="watch-heading"><div><div class="eyebrow">ĐANG XEM</div><h2 id="movieTitle"></h2></div><button id="stopButton" class="quiet">Đóng phim</button></div>
+    <div id="stage" class="stage"><video id="movie" playsinline></video><div id="caption" class="caption"></div>
+      <div id="overlay" class="overlay"><div class="loader"></div><h2 id="overlayTitle">Đang chuẩn bị phần mở đầu</h2><p id="overlayText">Bạn có thể chờ một lần lúc đầu; hình và giọng sẽ được phát cùng nhau.</p><button id="playButton" class="primary" hidden>▶ Phát phim</button></div>
+      <div class="stage-footer"><div class="timeline"><span id="time">00:00</span><input id="seek" type="range" min="0" max="100" step="0.1" value="0" aria-label="Tua phim"><span id="duration">00:00</span></div>
+      <div class="playback-bar"><button id="togglePlay" class="primary">▶ Phát</button><label class="check"><input id="showCaptions" type="checkbox">Hiện phụ đề Việt</label><input id="volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Âm lượng phim"><button id="fullscreen" class="quiet">Toàn màn hình</button><span id="bufferBadge" class="badge">Đang chuẩn bị</span></div></div>
+    </div>
+    <div class="status-panel"><div><strong id="phase">Đọc trước nguồn phim</strong><p id="progressText" class="muted"></p></div><button id="retryButton" class="quiet" hidden>Thử lại đoạn lỗi</button></div>
+    <p id="playError" class="error" role="alert"></p>
+    <p class="meet">Xem chung: trong Google Meet, chọn <b>Trình bày → Một thẻ Chrome → tab Movie Voice</b> và bật <b>chia sẻ âm thanh thẻ</b>. Giọng Việt đã nằm trong âm thanh của phim.</p>
+  </section>
+</main>
+<dialog id="settingsDialog"><form id="settingsForm"><div class="dialog-title"><h2>Kết nối Gemini</h2><button id="closeSettings" type="button" class="quiet" aria-label="Đóng cài đặt">✕</button></div><p class="muted">Key được lưu trong file cài đặt trên máy này, không đồng bộ trình duyệt. Chỉ gửi đoạn âm thanh cần xử lý tới Google khi bạn bắt đầu phim.</p>
+  <label for="apiKey">API key từ Google AI Studio</label><input id="apiKey" type="password" autocomplete="new-password" placeholder="Nhập key mới hoặc để trống để giữ key đã lưu">
+  <label for="textModel">Model nhận diện / dịch</label><input id="textModel" value="gemini-3.1-flash-lite" required>
+  <label for="ttsModel">Model tạo giọng</label><input id="ttsModel" value="gemini-3.8-flash-tts" required>
+  <label for="voice">Giọng</label><select id="voice"><option>Kore</option><option>Puck</option><option>Charon</option><option>Aoede</option><option>Fenrir</option><option>Leda</option><option>Orus</option><option>Zephyr</option></select>
+  <div class="actions"><button type="submit" class="primary">Lưu cài đặt</button><button id="checkKey" type="button" class="quiet">Kiểm tra key & nghe giọng Việt</button></div><p id="settingsStatus" role="status"></p><audio id="voicePreview" controls hidden></audio>
+</form></dialog>
+<script src="vendor/hls.min.js"></script><script src="player.js"></script>
+</body></html>

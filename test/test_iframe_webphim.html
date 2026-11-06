@@ -1,0 +1,26 @@
+
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' data: blob:; media-src 'self' data: blob:;">
+          <title>Web Phim Thực Tế - Iframe Embed + Strict CSP</title>
+          <style>
+            body { background: #090d16; color: #fff; font-family: sans-serif; margin: 0; padding: 20px; }
+            .movie-header { max-width: 900px; margin: 0 auto 15px; display: flex; justify-content: space-between; align-items: center; }
+            .badge { background: #e11d48; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+            .player-wrapper { max-width: 900px; height: 480px; margin: 0 auto; border: 1px solid #1e293b; border-radius: 10px; overflow: hidden; position: relative; background: #000; }
+            iframe { width: 100%; height: 100%; border: none; }
+          </style>
+        </head>
+        <body>
+          <div class="movie-header">
+            <h2>🍿 Rổ Phim / Motchill - Xem Phim: Kẻ Đứng Sau Màn Đêm (Tập 1 - Vietsub)</h2>
+            <span class="badge">SERVER VIP #1 (IFRAME + STRICT CSP)</span>
+          </div>
+          <div class="player-wrapper">
+            <iframe src="test_player.html" allow="autoplay"></iframe>
+          </div>
+        </body>
+        </html>
+        
