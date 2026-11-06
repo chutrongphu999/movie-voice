@@ -1,5 +1,5 @@
-"""Batch Subtitle Translator using Groq Fast LLMs, Gemini, and Google Translate fallback.
-Inspired by llm-subtrans for strict 1-to-1 line correspondence and context retention.
+"""Batch Subtitle Translator using Groq 120B LLM, Gemini, and Google Translate fallback.
+Inspired by llm-subtrans & VideoLingo for cinematic Vietnamese dubbing with rolling context.
 """
 import os
 import re
@@ -10,8 +10,8 @@ import aiohttp
 import groq
 
 GROQ_MODELS = [
-    "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
 ]
 
 GEMINI_MODELS = [
@@ -42,20 +42,20 @@ class Translator:
             self.groq_client = groq.Groq(api_key=groq_key)
 
     def _build_batch_prompt(self, lines: List[str], context_hint: str = "") -> str:
-        """Builds structured 1-to-1 subtitle prompt inspired by llm-subtrans."""
+        """Builds structured 1-to-1 dubbing script prompt."""
         prompt = (
-            "Bạn là dịch giả phụ đề và lồng tiếng phim chuyên nghiệp sang tiếng Việt.\n"
-            "Quy tắc dịch:\n"
-            "1. Dịch tự nhiên, ngắn gọn, súc tích, giữ đúng văn phong thoại đời thường để diễn viên lồng tiếng nói kịp thời gian.\n"
-            "2. Xưng hô chuẩn theo bối cảnh phim (ví dụ: tôi/bạn, anh/em, cậu/tớ, ta/ngươi).\n"
-            "3. Bắt buộc giữ nguyên số lượng dòng và mã số thứ tự #1, #2... tương ứng. Không giải thích thêm.\n"
-            "4. Định dạng trả về duy nhất cho mỗi dòng:\n"
-            "#{số thứ tự} Translation> {câu tiếng Việt}\n\n"
+            "Bạn là biên kịch lồng tiếng phim điện ảnh chuyên nghiệp sang tiếng Việt.\n"
+            "Quy tắc vàng:\n"
+            "1. Dịch thoát ý, tự nhiên như người Việt nói chuyện ngoài đời, ngắn gọn vừa khít khẩu hình và thời lượng câu thoại.\n"
+            "2. Tuyệt đối KHÔNG dịch word-by-word ngô nghê (ví dụ: 'Look,' ở đầu câu phải dịch là 'Nghe này,' hoặc 'Nhìn xem,'; 'National Guard' là 'Vệ binh Quốc gia'; 'What's wrong with you?' là 'Cậu bị làm sao thế?').\n"
+            "3. Giữ mạch xưng hô nhất quán với các câu trước đó trong phần <context>.\n"
+            "4. Bắt buộc giữ nguyên số lượng dòng và mã số #1, #2... tương ứng. Chỉ trả về đúng định dạng:\n"
+            "#{số thứ tự} Translation> {câu thoại tiếng Việt}\n\n"
         )
         if context_hint:
-            prompt += f"<context>{context_hint}</context>\n\n"
+            prompt += f"<context>\nCác câu thoại vừa nói trước đó:\n{context_hint}\n</context>\n\n"
 
-        prompt += "Danh sách các câu thoại cần dịch:\n"
+        prompt += "Danh sách các câu thoại cần dịch ngay:\n"
         for i, line in enumerate(lines, 1):
             prompt += f"#{i} Original> {line}\n"
 
@@ -88,7 +88,10 @@ class Translator:
         def _call():
             chat = self.groq_client.chat.completions.create(
                 messages=[
-                    {"role": "system", "content": "You are an expert movie dubbing translator into Vietnamese. Output only the requested #N Translation> lines."},
+                    {
+                        "role": "system",
+                        "content": "You are a Vietnamese movie dubbing scriptwriter. Output ONLY the requested #N Translation> lines in natural spoken Vietnamese."
+                    },
                     {"role": "user", "content": prompt}
                 ],
                 model=model_name,
@@ -127,7 +130,6 @@ class Translator:
                 split_lines = [s.strip() for s in full_text.splitlines() if s.strip()]
                 if len(split_lines) == len(lines):
                     return split_lines
-                # If line count mismatched, translate individually in parallel
                 tasks = [self._translate_google_single(session, l) for l in lines]
                 return await asyncio.gather(*tasks)
 
@@ -148,7 +150,7 @@ class Translator:
         clean_lines = [l.strip() for l in lines]
         prompt = self._build_batch_prompt(clean_lines, context_hint)
 
-        # 1. Try Groq fast LLM models first (~0.25s latency, high rate limit)
+        # 1. Try Groq fast LLM models first (120B flagship -> 20B)
         if self.groq_key:
             for model in GROQ_MODELS:
                 try:

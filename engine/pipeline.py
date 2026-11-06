@@ -1,4 +1,4 @@
-"""Movie Voice Dubbing Pipeline: Orchestrates ASR -> Batch Translation -> TTS."""
+"""Movie Voice Dubbing Pipeline: Orchestrates ASR -> Context-Aware Batch Translation -> Neural TTS."""
 import os
 import time
 import asyncio
@@ -13,7 +13,7 @@ class DubbingPipeline:
         self.asr = GroqASR()
         self.translator = Translator()
         self.tts = EdgeTTS()
-        # Session state: track processed cue times to avoid duplicate lines
+        # Session state: track processed cue times to avoid duplicate lines & keep rolling dialogue context
         self.spoken_cues: List[Dict[str, Any]] = []
 
     def reload_config(self):
@@ -24,8 +24,8 @@ class DubbingPipeline:
             groq_key=os.getenv("GROQ_API_KEY", "")
         )
 
-    def is_duplicate(self, text: str, start: float, threshold_sec: float = 3.0) -> bool:
-        """Avoids re-speaking duplicate lines within a small time window."""
+    def is_duplicate(self, text: str, start: float, threshold_sec: float = 4.0) -> bool:
+        """Avoids re-speaking duplicate lines within a time window."""
         norm = text.lower().strip()
         if not norm:
             return True
@@ -35,6 +35,13 @@ class DubbingPipeline:
             if (orig_match or text_match) and abs(item["start"] - start) < threshold_sec:
                 return True
         return False
+
+    def _get_recent_context(self) -> str:
+        """Returns up to 5 most recent translated dialogue lines for pronoun & plot consistency."""
+        recent = self.spoken_cues[-5:]
+        if not recent:
+            return ""
+        return "\n".join(f"- {c.get('original', '')} => {c.get('text', '')}" for c in recent)
 
     async def _synthesize_batch(
         self,
@@ -87,7 +94,7 @@ class DubbingPipeline:
     ) -> List[Dict[str, Any]]:
         """
         Receives an audio chunk captured by MSE hook,
-        runs ASR to extract dialogue with timestamps, translates to Vietnamese,
+        runs ASR to extract dialogue with timestamps, translates to Vietnamese with context,
         and synthesizes speech in parallel.
         """
         if not audio_bytes or len(audio_bytes) < 1000:
@@ -100,18 +107,19 @@ class DubbingPipeline:
             return []
         t_asr = time.monotonic() - t0
 
-        # Filter out cues already processed and cap batch size so responses return quickly
-        new_cues = [c for c in raw_cues if not self.is_duplicate(c["text"], c["start"])][:10]
+        # Filter out cues already processed
+        new_cues = [c for c in raw_cues if not self.is_duplicate(c["text"], c["start"])][:8]
         if not new_cues:
             return []
 
-        # 2. Batch Translation
+        # 2. Context-Aware Batch Translation
         t1 = time.monotonic()
         texts = [c["text"] for c in new_cues]
-        translated_texts = await self.translator.translate_batch(texts)
+        context_hint = self._get_recent_context()
+        translated_texts = await self.translator.translate_batch(texts, context_hint=context_hint)
         t_tr = time.monotonic() - t1
 
-        # 3. Parallel Speech Synthesis via Edge TTS
+        # 3. Parallel Speech Synthesis via Edge Neural TTS
         t2 = time.monotonic()
         synthesized_cues = await self._synthesize_batch(
             list(zip(new_cues, translated_texts)),
@@ -124,7 +132,7 @@ class DubbingPipeline:
         if synthesized_cues:
             first_t = synthesized_cues[0]["start"]
             last_t = synthesized_cues[-1]["end"]
-            sample = synthesized_cues[0]["text"][:50]
+            sample = synthesized_cues[0]["text"][:55]
             print(
                 f"[Pipeline] +{len(synthesized_cues)} câu ({first_t:.1f}s..{last_t:.1f}s) "
                 f"| ASR {t_asr:.2f}s, Dịch {t_tr:.2f}s, TTS {t_tts:.2f}s | \"{sample}\""
@@ -156,7 +164,7 @@ class DubbingPipeline:
         if is_vietnamese:
             translated_texts = texts
         else:
-            translated_texts = await self.translator.translate_batch(texts)
+            translated_texts = await self.translator.translate_batch(texts, context_hint=self._get_recent_context())
 
         return await self._synthesize_batch(
             list(zip(new_cues, translated_texts)),

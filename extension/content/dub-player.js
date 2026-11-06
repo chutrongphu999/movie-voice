@@ -288,34 +288,54 @@
     }
   }
 
-  // Scheduler loop: checks cueQueue every 100ms and plays lines sequentially
+  // Scheduler loop: checks cueQueue every 80ms and keeps strict real-time lip-sync (no domino lag!)
   setInterval(() => {
-    if (!config.enabled || !activeVideo || activeVideo.paused || isSpeaking || cueQueue.length === 0) {
+    if (!config.enabled || !activeVideo || activeVideo.paused || cueQueue.length === 0) {
       return;
     }
 
     const currTime = activeVideo.currentTime;
 
-    // 1. Drop cues that are too old (ended more than 12s before current playhead)
-    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 12.0) {
+    // 1. Drop cues that have already passed (> 0.8s past cue.end or > 2.8s past cue.start) so we NEVER speak stale lines!
+    while (
+      cueQueue.length > 0 &&
+      (currTime > cueQueue[0].end + 0.8 || currTime > cueQueue[0].start + 2.8)
+    ) {
       const dropped = cueQueue.shift();
-      sendClientLog("CUE_EXPIRED", `Cue ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s dropped at video=${currTime.toFixed(1)}s`);
+      sendClientLog("CUE_SKIPPED_LATE", `Skipped stale ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s at video=${currTime.toFixed(1)}s`);
     }
     if (cueQueue.length === 0) return;
 
+    // 2. If multiple cues are already due (e.g. two short lines back-to-back), skip to the one matching currTime
+    while (cueQueue.length >= 2 && currTime >= cueQueue[1].start - 0.1) {
+      cueQueue.shift();
+    }
+
+    // If currently speaking, check if the next cue is already overdue by >0.4s and cut off tail of old cue if needed
+    if (isSpeaking) {
+      if (cueQueue.length > 0 && currTime >= cueQueue[0].start + 0.6) {
+        stopCurrentSpeechOnly();
+      } else {
+        return;
+      }
+    }
+
     const nextCue = cueQueue[0];
 
-    // 2. If the next cue is due now (and not >12s in the future after a backward seek), play it!
-    if (currTime >= nextCue.start - 0.35 && currTime <= nextCue.end + 12.0) {
+    // 3. Play when playhead reaches nextCue.start (with 0.25s pre-roll)
+    if (currTime >= nextCue.start - 0.25 && currTime <= nextCue.end + 0.8) {
       cueQueue.shift();
-      let speed = 1.0 + (config.rate || 0) / 100;
-      const lag = currTime - nextCue.start;
-      if (lag > 1.5 || cueQueue.length >= 2) {
-        speed = Math.min(1.30, Math.max(speed, 1.15));
-      }
-      playCueNow(nextCue, Math.max(0.8, Math.min(1.35, speed)));
+      let baseSpeed = 1.0 + (config.rate || 0) / 100;
+      // Time-fit: speed up slightly if TTS duration is longer than the available time window before the next cue
+      const slotEnd = cueQueue.length > 0 ? Math.min(nextCue.end + 0.4, cueQueue[0].start) : (nextCue.end + 0.5);
+      const availWindow = Math.max(1.0, slotEnd - Math.max(currTime, nextCue.start));
+      const ttsDur = nextCue.duration || 2.0;
+      const fitSpeed = ttsDur / availWindow;
+      const finalSpeed = Math.max(0.9, Math.min(1.35, Math.max(baseSpeed, fitSpeed)));
+
+      playCueNow(nextCue, finalSpeed);
     }
-  }, 100);
+  }, 80);
 
   // Playhead-synchronized MSE Batch Scheduler:
   // Always picks the earliest batch right at/ahead of activeVideo.currentTime (within +32s lookahead)

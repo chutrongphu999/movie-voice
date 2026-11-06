@@ -1,4 +1,4 @@
-"""Groq Whisper ASR Provider for fast, accurate speech-to-text with timestamps and anti-hallucination filters."""
+"""Groq Whisper ASR Provider with strict anti-hallucination filters and segment merging."""
 import array
 import math
 import os
@@ -11,11 +11,28 @@ import groq
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
-# Known Whisper hallucinations on background music / silence chunks
-HALLUCINATION_PHRASES = {
-    "thank you",
-    "thanks for watching",
+# Known Whisper hallucinations on background music / action / silence chunks
+HALLUCINATION_SUBSTRINGS = [
     "thank you for watching",
+    "thanks for watching",
+    "hope you enjoyed",
+    "hope you enjoy",
+    "welcome to the first episode",
+    "don't forget to subscribe",
+    "please subscribe",
+    "like and subscribe",
+    "see you in the next",
+    "subtitles by",
+    "amara.org",
+    "transcribed by",
+    "hy vọng bạn thích video",
+    "chào mừng đến với tập đầu tiên",
+    "cảm ơn các bạn đã xem",
+    "hãy đăng ký kênh",
+]
+
+HALLUCINATION_EXACT = {
+    "thank you",
     "thanks",
     "thank you very much",
     "you",
@@ -25,15 +42,19 @@ HALLUCINATION_PHRASES = {
     "bye",
     "bye bye",
     "goodbye",
-    "see you next time",
-    "subtitles by",
-    "amara.org",
-    "please subscribe",
     "subscribe",
     "cảm ơn",
-    "cảm ơn các bạn đã theo dõi",
-    "hãy đăng ký kênh",
+    "uh",
+    "um",
+    "ah",
+    "oh",
+    "hmm",
 }
+
+ASR_MODELS = [
+    "whisper-large-v3-turbo",
+    "whisper-large-v3",
+]
 
 
 def compute_pcm_rms(wav_bytes: bytes) -> float:
@@ -41,14 +62,12 @@ def compute_pcm_rms(wav_bytes: bytes) -> float:
     if len(wav_bytes) <= 44:
         return 0.0
     pcm = wav_bytes[44:]
-    # Ensure even byte length for int16
     if len(pcm) % 2 != 0:
         pcm = pcm[:-1]
     if not pcm:
         return 0.0
     samples = array.array("h")
     samples.frombytes(pcm)
-    # Sample every 16th frame for speed
     step = 16
     subset = samples[::step]
     if not subset:
@@ -58,26 +77,61 @@ def compute_pcm_rms(wav_bytes: bytes) -> float:
 
 
 def is_hallucination_text(text: str, duration: float) -> bool:
-    """Checks if a transcribed segment is a known Whisper silence/music hallucination."""
-    cleaned = re.sub(r"[^\w\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", "", text.lower()).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    if not cleaned or len(cleaned) <= 1:
+    """Checks if a transcribed segment is a Whisper silence/music/YouTube hallucination or stutter loop."""
+    lower = text.lower().strip()
+    for sub in HALLUCINATION_SUBSTRINGS:
+        if sub in lower:
+            return True
+
+    cleaned = re.sub(
+        r"[^\w\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]",
+        " ",
+        lower
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned or len(cleaned) <= 2:
         return True
-    if cleaned in HALLUCINATION_PHRASES:
+    if cleaned in HALLUCINATION_EXACT:
         return True
-    if "amara.org" in text.lower() or "subtitles by" in text.lower():
+
+    words = cleaned.split()
+    # Filter repetitive interjections like "uh uh uh uh" or "ừ ừ ừ ừ" or "oh oh oh"
+    unique_words = set(words)
+    if len(words) >= 3 and len(unique_words) == 1:
         return True
-    # Single or two-word phrase stretched across > 8 seconds is always a music hallucination
-    word_count = len(cleaned.split())
-    if duration > 8.0 and word_count <= 2:
+    if len(words) >= 4 and len(unique_words) <= 2:
         return True
+
+    # Single or two-word phrase stretched across > 6 seconds is a music hallucination
+    if duration > 6.0 and len(words) <= 2:
+        return True
+
     return False
 
 
-ASR_MODELS = [
-    "whisper-large-v3-turbo",
-    "whisper-large-v3",
-]
+def merge_short_segments(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merges consecutive short segments that belong to the same sentence (gap < 0.45s)
+    so the translator gets complete sentences instead of broken fragments.
+    """
+    if len(cues) <= 1:
+        return cues
+
+    merged = [cues[0].copy()]
+    for cur in cues[1:]:
+        prev = merged[-1]
+        gap = cur["start"] - prev["end"]
+        combined_dur = cur["end"] - prev["start"]
+        prev_ends_sentence = bool(re.search(r"[.!?…]$", prev["text"].strip()))
+
+        # Merge if gap is small and either previous segment didn't finish a sentence or is very short
+        if gap < 0.45 and combined_dur <= 6.5 and (not prev_ends_sentence or (prev["end"] - prev["start"]) < 1.8):
+            prev["end"] = round(cur["end"], 3)
+            prev["text"] = f"{prev['text'].rstrip()} {cur['text'].lstrip()}".strip()
+        else:
+            merged.append(cur.copy())
+
+    return merged
 
 
 class GroqASR:
@@ -122,8 +176,7 @@ class GroqASR:
 
     async def transcribe(self, audio_bytes: bytes, time_offset: float = 0.0) -> List[Dict[str, Any]]:
         """
-        Transcribes audio bytes and returns segments with clamped timestamps and hallucination filtering.
-        Each cue: {"start": float, "end": float, "text": str}
+        Transcribes audio bytes and returns clean, merged segments with clamped timestamps.
         """
         if not self.client:
             raise RuntimeError("Chưa cấu hình GROQ_API_KEY trong engine/.env!")
@@ -137,15 +190,13 @@ class GroqASR:
         if len(wav_bytes) < 3200:
             return []
 
-        # 16kHz * 1 channel * 2 bytes/sample = 32000 bytes per second
         wav_duration = max(0.3, (len(wav_bytes) - 44) / 32000.0)
 
-        # Skip near-silent chunks before calling Whisper API
+        # Skip silent / low-energy chunks before calling Whisper API
         rms = compute_pcm_rms(wav_bytes)
-        if rms < 55.0:
+        if rms < 75.0:
             return []
 
-        # Alternate between whisper-large-v3-turbo and whisper-large-v3 (each has its own 20 RPM bucket = 40 RPM total)
         result = None
         for attempt in range(3):
             chosen_model = ASR_MODELS[(self._model_idx + attempt) % len(ASR_MODELS)]
@@ -161,18 +212,31 @@ class GroqASR:
                 self._model_idx = (self._model_idx + 1) % len(ASR_MODELS)
                 break
             except groq.RateLimitError:
-                print(f"[ASR] Rate limit on {chosen_model}, switching model / waiting...")
-                await asyncio.sleep(1.2 * (attempt + 1))
+                print(f"[ASR] Rate limit on {chosen_model}, switching model...")
+                await asyncio.sleep(1.0 * (attempt + 1))
             except Exception as e:
                 print(f"[ASR Warning] Groq transcription error on {chosen_model}: {e}")
                 return []
 
         if result is None:
             return []
-        cues = []
-        segments = getattr(result, "segments", []) or []
 
-        for seg in segments:
+        raw_segments = getattr(result, "segments", []) or []
+
+        # Detect if Whisper went into a repetition loop across segments (e.g. repeating the same line 3+ times)
+        seg_texts = [
+            (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")).strip().lower()
+            for s in raw_segments
+        ]
+        text_counts = {}
+        for t in seg_texts:
+            if t:
+                text_counts[t] = text_counts.get(t, 0) + 1
+
+        cues = []
+        prev_norm = ""
+
+        for seg in raw_segments:
             is_dict = isinstance(seg, dict)
             start = float(seg.get("start", 0.0) if is_dict else getattr(seg, "start", 0.0))
             end = float(seg.get("end", 0.0) if is_dict else getattr(seg, "end", 0.0))
@@ -180,24 +244,39 @@ class GroqASR:
             no_speech_prob = float(
                 seg.get("no_speech_prob", 0.0) if is_dict else getattr(seg, "no_speech_prob", 0.0)
             )
+            avg_logprob = float(
+                seg.get("avg_logprob", -0.2) if is_dict else getattr(seg, "avg_logprob", -0.2)
+            )
+            compression_ratio = float(
+                seg.get("compression_ratio", 1.0) if is_dict else getattr(seg, "compression_ratio", 1.0)
+            )
 
-            # Drop high no_speech_prob or segments starting past actual audio length
-            if no_speech_prob > 0.65 or start >= wav_duration - 0.15:
+            # Strict Whisper quality & anti-hallucination thresholds
+            if no_speech_prob > 0.55 or avg_logprob < -1.05 or compression_ratio > 2.15:
+                continue
+            if start >= wav_duration - 0.15:
                 continue
 
-            # Clamp end timestamp to actual WAV duration so Whisper never invents 30s cues
-            end = min(end, wav_duration + 0.25)
+            end = min(end, wav_duration + 0.2)
             seg_dur = end - start
-            if not text or seg_dur < 0.2:
+            if not text or seg_dur < 0.25:
+                continue
+
+            norm = text.lower()
+            # Drop if Whisper repeated the exact same phrase 2+ times in this chunk (loop hallucination)
+            if text_counts.get(norm, 0) >= 2 and norm == prev_norm:
+                continue
+            if text_counts.get(norm, 0) >= 3:
                 continue
 
             if is_hallucination_text(text, seg_dur):
                 continue
 
+            prev_norm = norm
             cues.append({
                 "start": round(time_offset + start, 3),
                 "end": round(time_offset + end, 3),
                 "text": text
             })
 
-        return cues
+        return merge_short_segments(cues)

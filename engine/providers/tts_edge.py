@@ -1,4 +1,4 @@
-"""High quality Vietnamese Text-To-Speech using Edge TTS with instant Google TTS fallback & persistent cache."""
+"""High quality Vietnamese Text-To-Speech using Edge TTS with Google TTS fallback & persistent cache."""
 import re
 import hashlib
 import asyncio
@@ -39,10 +39,10 @@ def clean_text_for_speech(text: str) -> str:
 
 
 def estimate_mp3_duration(audio_bytes: bytes) -> float:
-    """Estimates MP3 duration in seconds from byte size (48kbps = 6000 bytes/s, 32kbps = 4000 bytes/s)."""
+    """Estimates MP3 duration in seconds from byte size."""
     if not audio_bytes:
         return 0.0
-    return round(max(0.4, len(audio_bytes) / 5500.0), 2)
+    return round(max(0.4, len(audio_bytes) / 5800.0), 2)
 
 
 def split_text_chunks(text: str, max_chars: int = 180) -> List[str]:
@@ -78,8 +78,7 @@ def split_text_chunks(text: str, max_chars: int = 180) -> List[str]:
 class EdgeTTS:
     def __init__(self, default_voice: str = "vi-VN-HoaiMyNeural"):
         self.default_voice = default_voice
-        self._sem = asyncio.Semaphore(3)
-        self._edge_cooldown_until = 0.0
+        self._sem = asyncio.Semaphore(4)
 
     def _get_cache_key(self, text: str, voice: str, rate: int, pitch: int) -> str:
         raw = f"{text}|{voice}|{rate}|{pitch}".encode("utf-8")
@@ -108,7 +107,7 @@ class EdgeTTS:
         return b"".join(chunks)
 
     async def _synthesize_google_tts(self, clean_text: str) -> bytes:
-        """Fast & reliable Google Translate Vietnamese TTS fallback when Edge TTS drops connection."""
+        """Fallback to Google Vietnamese TTS only if Edge Neural TTS fails for this specific line."""
         sub_chunks = split_text_chunks(clean_text, 180)
         audio_parts = []
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4.0)) as session:
@@ -139,8 +138,8 @@ class EdgeTTS:
         pitch: int = 0
     ) -> Tuple[bytes, float, str]:
         """
-        Synthesizes text to MP3 audio bytes with strict 3.5s timeout + Google TTS fallback.
-        Returns: (audio_bytes, duration_seconds, audio_id)
+        Synthesizes text to MP3 audio bytes using Microsoft Edge Neural Voice (HoaiMy / NamMinh),
+        falling back to Google TTS only if Edge TTS errors out on that specific sentence.
         """
         clean_text = clean_text_for_speech(text)
         if not clean_text or len(clean_text) < 2:
@@ -163,23 +162,19 @@ class EdgeTTS:
                 MEMORY_CACHE[cache_key] = (data, dur)
                 return data, dur, cache_key
 
-        # 3. Call Edge TTS with fast 2.2s timeout (skip if Edge TTS recently failed/throttled)
-        import time
-        now = time.monotonic()
+        # 3. Call Edge Neural TTS inside semaphore (3.5s timeout starts only AFTER semaphore is acquired!)
         async with self._sem:
-            if now >= self._edge_cooldown_until:
-                try:
-                    audio_bytes = await asyncio.wait_for(
-                        self._run_edge_once(clean_text, voice_name, rate, pitch, use_custom=True),
-                        timeout=2.2
-                    )
-                    if audio_bytes and len(audio_bytes) > 200:
-                        return self._save_to_cache(cache_key, cache_file, audio_bytes)
-                except Exception:
-                    # Put Edge TTS on a 45s cooldown so subsequent lines use instant Google TTS (~0.2s) instead of stalling 6s
-                    self._edge_cooldown_until = time.monotonic() + 45.0
+            try:
+                audio_bytes = await asyncio.wait_for(
+                    self._run_edge_once(clean_text, voice_name, rate, pitch, use_custom=True),
+                    timeout=3.5
+                )
+                if audio_bytes and len(audio_bytes) > 200:
+                    return self._save_to_cache(cache_key, cache_file, audio_bytes)
+            except Exception:
+                pass
 
-            # 4. Immediate fallback to Google Vietnamese TTS (~0.2s)
+            # 4. Per-line fallback to Google Vietnamese TTS (~0.2s) if Edge failed
             try:
                 g_bytes = await self._synthesize_google_tts(clean_text)
                 if g_bytes and len(g_bytes) > 200:
