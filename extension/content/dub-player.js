@@ -13,7 +13,8 @@
     voice: "vi-VN-HoaiMyNeural",
     ducking: 0.20,
     rate: 0,
-    pitch: 0
+    pitch: 0,
+    mode: "audio" // "audio" = nghe tiếng gốc (Whisper) | "hardsub" = đọc chữ sub gắn cứng trên hình (Gemini Vision)
   };
 
   if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.sync) {
@@ -107,7 +108,7 @@
   }
 
   setInterval(() => {
-    if (!config.enabled || !activeVideo) return;
+    if (!config.enabled || !activeVideo || config.mode === "hardsub") return;
     const t = activeVideo.currentTime;
     const ahead = processedUpTo - t;
     const gateActive = (Date.now() - gateWindowStart) < 40000;
@@ -386,6 +387,7 @@
   // Playhead-synchronized MSE Batch Scheduler:
   // Always picks the earliest batch right at/ahead of activeVideo.currentTime (within +32s lookahead)
   async function processNextMseBatch() {
+    if (config.mode === "hardsub") { pendingMseBatches = []; return; }
     if (!config.enabled || inFlightUploads >= 2 || pendingMseBatches.length === 0) return;
 
     const currTime = activeVideo ? activeVideo.currentTime : 0;
@@ -486,6 +488,110 @@
     }
   }, 600);
 
+  // ---------- Hard-sub mode: read burned-in subtitle from the video frame (no OCR engine, Gemini Vision) ----------
+  const MASK_W = 160;
+  const MASK_H = 28;
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = MASK_W;
+  maskCanvas.height = MASK_H;
+  const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
+  const cropCanvas = document.createElement("canvas");
+  let hsPrevMask = null;      // mask of previous sample (to detect "stable" subtitle)
+  let hsSentMask = null;      // mask of the last subtitle we sent
+  let hsLastSendAt = 0;
+  let hsInFlight = false;
+  let hsWarnedTaint = false;
+
+  // Subtitle band: bottom 28% of the frame, central 90% width
+  function cropRect(v) {
+    const w = v.videoWidth, h = v.videoHeight;
+    return { sx: Math.round(w * 0.05), sy: Math.round(h * 0.72), sw: Math.round(w * 0.9), sh: Math.round(h * 0.28) };
+  }
+
+  function sampleMask(v) {
+    const r = cropRect(v);
+    maskCtx.drawImage(v, r.sx, r.sy, r.sw, r.sh, 0, 0, MASK_W, MASK_H);
+    const px = maskCtx.getImageData(0, 0, MASK_W, MASK_H).data;
+    const mask = new Uint8Array(MASK_W * MASK_H);
+    let on = 0;
+    for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+      const g = px[i] * 0.3 + px[i + 1] * 0.59 + px[i + 2] * 0.11;
+      if (g > 215) { mask[j] = 1; on++; }
+    }
+    return { mask, ratio: on / mask.length };
+  }
+
+  function maskDiff(a, b) {
+    if (!a || !b) return 1;
+    let x = 0, u = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] || b[i]) { u++; if (a[i] !== b[i]) x++; }
+    }
+    return u === 0 ? 0 : x / u;
+  }
+
+  async function sendHardsubFrame(v) {
+    const r = cropRect(v);
+    const outW = Math.min(720, r.sw);
+    cropCanvas.width = outW;
+    cropCanvas.height = Math.round(outW * r.sh / r.sw);
+    cropCanvas.getContext("2d").drawImage(v, r.sx, r.sy, r.sw, r.sh, 0, 0, cropCanvas.width, cropCanvas.height);
+    const dataUrl = cropCanvas.toDataURL("image/jpeg", 0.72);
+    const b64 = dataUrl.split(",")[1];
+    const videoTime = v.currentTime;
+    hsInFlight = true;
+    try {
+      const res = await new Promise((resolve) => {
+        chrome.runtime.sendMessage(
+          { type: "DUB_HARDSUB", imageB64: b64, videoTime, voice: config.voice, rate: config.rate, pitch: config.pitch },
+          (r2) => resolve(r2)
+        );
+      });
+      if (res && res.ok && res.cues && res.cues.length) {
+        // cue.start = time the subtitle appeared; speak as soon as it arrives
+        res.cues.forEach((c) => { c.start = Math.min(c.start, v.currentTime); });
+        enqueueCues(res.cues);
+      } else if (res && !res.ok && !isSpeaking) {
+        setStatus(`Lỗi Engine: ${String(res.error).slice(0, 40)}`);
+      }
+    } catch (e) {
+    } finally {
+      hsInFlight = false;
+    }
+  }
+
+  setInterval(() => {
+    if (!config.enabled || config.mode !== "hardsub" || !activeVideo || activeVideo.paused) return;
+    const v = activeVideo;
+    if (!v.videoWidth || v.readyState < 2) return;
+    let cur;
+    try {
+      cur = sampleMask(v);
+    } catch (e) {
+      if (!hsWarnedTaint) {
+        hsWarnedTaint = true;
+        sendClientLog("HARDSUB_CANVAS_BLOCKED", String(e));
+        setStatus("⚠️ Trang chặn đọc khung hình video");
+      }
+      return;
+    }
+    const present = cur.ratio > 0.004 && cur.ratio < 0.3;
+    const stable = present && hsPrevMask && maskDiff(hsPrevMask, cur.mask) < 0.25;
+    hsPrevMask = cur.mask;
+
+    if (!present) {
+      hsSentMask = null; // subtitle gone -> the next one counts as new
+      return;
+    }
+    if (!stable || hsInFlight) return;
+    if (Date.now() - hsLastSendAt < 1500) return;
+    if (hsSentMask && maskDiff(hsSentMask, cur.mask) < 0.4) return; // same subtitle already sent
+
+    hsSentMask = cur.mask;
+    hsLastSendAt = Date.now();
+    sendHardsubFrame(v);
+  }, 300);
+
   // Listen for MSE audio batches from mse-hook.js
   window.addEventListener("message", (event) => {
     if (!event.data || event.data.type !== "__MOVIE_VOICE_MSE_BATCH__" || !event.data.buffer) {
@@ -535,6 +641,10 @@
       btn.innerText = config.enabled ? "🎙️ LỒNG TIẾNG: BẬT" : "🎙️ LỒNG TIẾNG: TẮT";
       btn.classList.toggle("active", Boolean(config.enabled));
     }
+    const modeBtn = uiContainer.querySelector(".mv-mode-btn");
+    if (modeBtn) {
+      modeBtn.innerText = config.mode === "hardsub" ? "📝 Đọc sub trên hình" : "🔊 Nghe tiếng gốc";
+    }
   }
 
   function mountUI(video) {
@@ -543,8 +653,26 @@
     uiContainer.className = "movie-voice-floating-bar";
     uiContainer.innerHTML = `
       <button class="mv-toggle-btn ${config.enabled ? 'active' : ''}">🎙️ LỒNG TIẾNG: BẬT</button>
+      <button class="mv-mode-btn">🔊 Nghe tiếng gốc</button>
       <span class="mv-status-text">Sẵn sàng</span>
     `;
+
+    uiContainer.querySelector(".mv-mode-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      getAudioContext();
+      config.mode = config.mode === "hardsub" ? "audio" : "hardsub";
+      cueQueue = [];
+      stopCurrentSpeechOnly();
+      autoPaused = false;
+      hsSentMask = null;
+      hsPrevMask = null;
+      if (config.mode === "audio") resetGate(activeVideo ? activeVideo.currentTime : 0);
+      if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.sync) {
+        chrome.storage.sync.set({ mode: config.mode });
+      }
+      setStatus(config.mode === "hardsub" ? "Đang đọc sub trên hình..." : "Đang nghe tiếng gốc...");
+      updateUI();
+    });
 
     uiContainer.querySelector(".mv-toggle-btn").addEventListener("click", (e) => {
       e.stopPropagation();

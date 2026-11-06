@@ -1,11 +1,13 @@
 """Movie Voice Dubbing Pipeline: Orchestrates ASR -> Context-Aware Batch Translation -> Neural TTS."""
 import os
+import re
 import time
 import asyncio
 from typing import List, Dict, Any
 from providers.asr_groq import GroqASR
 from providers.translate_gemini import Translator
 from providers.tts_edge import EdgeTTS
+from providers.ocr_gemini import SubtitleReader
 
 
 class DubbingPipeline:
@@ -13,12 +15,16 @@ class DubbingPipeline:
         self.asr = GroqASR()
         self.translator = Translator()
         self.tts = EdgeTTS()
+        self.ocr = SubtitleReader()
+        self._last_hardsub_norm = ""
+        self._last_hardsub_time = -999.0
         # Session state: track processed cue times to avoid duplicate lines & keep rolling dialogue context
         self.spoken_cues: List[Dict[str, Any]] = []
 
     def reload_config(self):
         """Reloads keys and settings from environment."""
         self.asr.update_key(os.getenv("GROQ_API_KEY", ""))
+        self.ocr.update_key(os.getenv("GEMINI_API_KEY", ""))
         self.translator.update_keys(
             gemini_key=os.getenv("GEMINI_API_KEY", ""),
             groq_key=os.getenv("GROQ_API_KEY", "")
@@ -139,6 +145,40 @@ class DubbingPipeline:
             )
 
         return synthesized_cues
+
+    async def process_hardsub_frame(
+        self,
+        jpeg_bytes: bytes,
+        video_time: float,
+        voice: str = "vi-VN-HoaiMyNeural",
+        rate: int = 0,
+        pitch: int = 0
+    ) -> List[Dict[str, Any]]:
+        """Reads burned-in subtitle from a cropped frame (Gemini Vision) and speaks it. No translation needed."""
+        t0 = time.monotonic()
+        text = await self.ocr.read(jpeg_bytes)
+        t_ocr = time.monotonic() - t0
+        if not text:
+            return []
+
+        # Same/similar subtitle as the previous one -> already spoken
+        norm = re.sub(r"\W+", "", text.lower())
+        if norm and norm == self._last_hardsub_norm:
+            return []
+        if norm and self._last_hardsub_norm and (
+            norm in self._last_hardsub_norm or self._last_hardsub_norm in norm
+        ) and abs(video_time - self._last_hardsub_time) < 3.0:
+            return []
+        self._last_hardsub_norm = norm
+        self._last_hardsub_time = video_time
+
+        t1 = time.monotonic()
+        cue = {"start": video_time, "end": video_time + max(1.5, min(6.0, len(text) / 14.0)), "text": text}
+        out = await self._synthesize_batch([(cue, text)], voice=voice, rate=rate, pitch=pitch)
+        t_tts = time.monotonic() - t1
+        if out:
+            print(f"[HardSub] {video_time:.1f}s | OCR {t_ocr:.2f}s, TTS {t_tts:.2f}s | \"{text[:60]}\"")
+        return out
 
     async def process_subtitles(
         self,

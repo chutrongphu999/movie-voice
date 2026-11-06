@@ -111,6 +111,26 @@ async def dub_audio_chunk(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/dub/hardsub")
+async def dub_hardsub(
+    file: UploadFile = File(...),
+    video_time: float = Form(0.0),
+    voice: str = Form("vi-VN-HoaiMyNeural"),
+    rate: int = Form(0),
+    pitch: int = Form(0)
+):
+    """Receives a cropped subtitle-band frame (JPEG), reads the burned-in subtitle and returns a voiced cue."""
+    try:
+        data = await file.read()
+        if not data:
+            return {"cues": []}
+        cues = await pipeline.process_hardsub_frame(data, video_time, voice=voice, rate=rate, pitch=pitch)
+        return {"cues": cues}
+    except Exception as e:
+        print(f"[Error in /api/dub/hardsub]: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/dub/subtitles")
 async def dub_subtitles(req: SubtitlesRequest):
     """

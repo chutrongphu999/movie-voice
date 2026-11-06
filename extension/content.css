@@ -56,3 +56,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+.movie-voice-floating-bar .mv-mode-btn { margin-left: 6px; padding: 4px 10px; border-radius: 14px; border: 1px solid rgba(255,255,255,.35); background: rgba(0,0,0,.55); color: #fff; font-size: 12px; cursor: pointer; }
+.movie-voice-floating-bar .mv-mode-btn:hover { background: rgba(255,255,255,.2); }
