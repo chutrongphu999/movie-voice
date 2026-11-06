@@ -1,15 +1,36 @@
-server/.venv/
+# Python & Virtualenv
 __pycache__/
 *.pyc
-*.log
-test/voice_sample.mp3
-server/ocr/node_modules/
-server/webdeps/node_modules/
+*.pyo
+*.pyd
+.venv/
+engine/.venv/
+server/.venv/
+
+# Cache & Storage
+.cache/
+engine/.cache/
 server/.cache/
+*.log
+
+# Sensitive Settings & Keys
+settings.json
+engine/settings.json
+.env
+engine/.env
 server/.local-settings.json
 server/.local-settings.tmp
-test/ocr_crop.png
-test/piper_sample.wav
+
+# References & downloaded repos
+_refs/
+node_modules/
+voices/**/*.wav
+!voices/**/ref.wav
+
+# Models (weights downloaded locally)
+engine/models/*.onnx
+engine/models/*.onnx.json
+engine/models/*.bin
 server/models/*.onnx
 server/models/*.onnx.json
 server/models/*.traineddata
