@@ -66,30 +66,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === "DUB_HARDSUB") {
-    (async () => {
-      try {
-        const bytes = base64ToUint8Array(msg.imageB64);
-        const form = new FormData();
-        form.append("file", new Blob([bytes], { type: "image/jpeg" }), "sub.jpg");
-        form.append("video_time", String(msg.videoTime || 0));
-        form.append("voice", msg.voice || "vi-VN-HoaiMyNeural");
-        form.append("rate", String(msg.rate || 0));
-        form.append("pitch", String(msg.pitch || 0));
-        const resp = await fetch(`${DEFAULT_ENGINE}/api/dub/hardsub`, { method: "POST", body: form });
-        if (!resp.ok) {
-          sendResponse({ ok: false, error: `HTTP ${resp.status}` });
-          return;
-        }
-        const data = await resp.json();
-        sendResponse({ ok: true, cues: data.cues || [] });
-      } catch (err) {
-        sendResponse({ ok: false, error: err.message });
-      }
-    })();
-    return true;
-  }
-
   if (msg.type === "DUB_SUBTITLES") {
     (async () => {
       try {

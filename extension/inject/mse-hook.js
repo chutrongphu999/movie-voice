@@ -1,14 +1,10 @@
-// Movie Voice - Media Source Extensions (MSE) Hook v4.4
-// Runs in MAIN world at document_start to intercept audio streams with exact buffered timestamps
+// Movie Voice - Media Source Extensions (MSE) & Subtitle Network Hook
+// Runs in MAIN world at document_start (inspired by cat-catch & voice-over-translation)
 (function () {
   "use strict";
 
   if (window.__movieVoiceMseHooked) return;
   window.__movieVoiceMseHooked = true;
-
-  if (typeof window.MediaSource === "undefined" || !window.MediaSource.prototype) {
-    return;
-  }
 
   const origToString = Function.prototype.toString;
   const nativeStrMap = new WeakMap();
@@ -29,7 +25,198 @@
     });
   } catch (e) {}
 
-  // Helper to read buffered TimeRanges into array of [start, end]
+  // ==================== 1. Soft Subtitle (.vtt / .srt) Network Hook ====================
+  function parseTimestamp(str) {
+    const clean = str.trim().replace(",", ".");
+    const parts = clean.split(":").map(Number);
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return 0;
+  }
+
+  function parseSubFileText(rawText) {
+    if (!rawText || typeof rawText !== "string") return [];
+    const lines = rawText.replace(/\r\n/g, "\n").split("\n");
+    const cues = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i].trim();
+      if (line.includes("-->")) {
+        const m = line.match(/((?:\d+:)?\d{2}:\d{2}[.,]\d{3})\s*-->\s*((?:\d+:)?\d{2}:\d{2}[.,]\d{3})/);
+        if (m) {
+          const start = parseTimestamp(m[1]);
+          const end = parseTimestamp(m[2]);
+          const textLines = [];
+          i++;
+          while (i < lines.length && lines[i].trim() !== "") {
+            textLines.push(lines[i].trim().replace(/<[^>]+>/g, ""));
+            i++;
+          }
+          const text = textLines.join(" ").trim();
+          if (text && end > start) {
+            cues.push({ start, end, text });
+          }
+          continue;
+        }
+      }
+      i++;
+    }
+    return cues;
+  }
+
+  function checkAndEmitSubtitleText(url, text) {
+    if (!text || text.length < 20 || text.length > 2000000) return;
+    const isSubUrl = /\.(vtt|srt)(\?|$)/i.test(url || "");
+    const looksLikeSub = text.startsWith("WEBVTT") || (isSubUrl && text.includes("-->"));
+    if (!looksLikeSub) return;
+
+    const cues = parseSubFileText(text);
+    if (cues.length >= 5) {
+      window.postMessage({ type: "__MOVIE_VOICE_SUBTITLE_FILE__", url, cues }, "*");
+    }
+  }
+
+  try {
+    const origFetch = window.fetch;
+    if (typeof origFetch === "function") {
+      window.fetch = registerNativeStr(
+        new Proxy(origFetch, {
+          apply(target, thisArg, args) {
+            const reqUrl = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
+            const p = Reflect.apply(target, thisArg, args);
+            if (/\.(vtt|srt)(\?|$)/i.test(reqUrl)) {
+              p.then((resp) => {
+                if (resp && resp.ok) {
+                  resp.clone().text().then((txt) => checkAndEmitSubtitleText(reqUrl, txt)).catch(() => {});
+                }
+              }).catch(() => {});
+            }
+            return p;
+          }
+        }),
+        origFetch
+      );
+    }
+
+    const origXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = registerNativeStr(
+      new Proxy(origXhrOpen, {
+        apply(target, thisArg, args) {
+          const url = String(args[1] || "");
+          if (/\.(vtt|srt)(\?|$)/i.test(url)) {
+            thisArg.addEventListener("load", function () {
+              try {
+                if (typeof this.responseText === "string") {
+                  checkAndEmitSubtitleText(url, this.responseText);
+                }
+              } catch (e) {}
+            });
+          }
+          return Reflect.apply(target, thisArg, args);
+        }
+      }),
+      origXhrOpen
+    );
+  } catch (e) {}
+
+  // ==================== 2. MSE Audio Stream Hook ====================
+  if (typeof window.MediaSource === "undefined" || !window.MediaSource.prototype) {
+    return;
+  }
+
+  function containsAscii(u8, needle) {
+    const nLen = needle.length;
+    if (u8.length < nLen) return false;
+    const c0 = needle.charCodeAt(0);
+    const limit = u8.length - nLen;
+    for (let i = 0; i <= limit; i++) {
+      if (u8[i] === c0) {
+        let match = true;
+        for (let j = 1; j < nLen; j++) {
+          if (u8[i + j] !== needle.charCodeAt(j)) {
+            match = false;
+            break;
+          }
+        }
+        if (match) return true;
+      }
+    }
+    return false;
+  }
+
+  // Walks top-level ISO BMFF (MP4) boxes to cleanly separate [ftyp+moov] init header from [moof+mdat] media fragments
+  // and verifies whether the moov header contains an audio track ('soun' / 'mp4a' / 'Opus').
+  function parseMp4Buffer(u8) {
+    if (!u8 || u8.length < 8) return { type: "unknown" };
+
+    // WebM EBML header: 0x1A 0x45 0xDF 0xA3
+    if (u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3) {
+      return { type: "pure_init", initBytes: u8, mediaBytes: null, hasAudio: true };
+    }
+
+    let offset = 0;
+    let moovStart = -1;
+    let moovEnd = -1;
+    let mediaOffset = -1;
+
+    while (offset + 8 <= u8.length) {
+      const size = (
+        (u8[offset] << 24) |
+        (u8[offset + 1] << 16) |
+        (u8[offset + 2] << 8) |
+        u8[offset + 3]
+      ) >>> 0;
+      const boxType = String.fromCharCode(u8[offset + 4], u8[offset + 5], u8[offset + 6], u8[offset + 7]);
+
+      if (size < 8) break;
+
+      if (boxType === "moov") {
+        moovStart = offset;
+        moovEnd = Math.min(u8.length, offset + size);
+      } else if (boxType === "moof" || boxType === "sidx" || boxType === "emsg") {
+        if (moovStart !== -1) {
+          mediaOffset = offset;
+          break;
+        }
+      }
+
+      if (offset + size > u8.length) break;
+      offset += size;
+    }
+
+    if (moovStart !== -1) {
+      const moovSlice = u8.subarray(moovStart, moovEnd);
+      const hasAudio =
+        containsAscii(moovSlice, "soun") ||
+        containsAscii(moovSlice, "mp4a") ||
+        containsAscii(moovSlice, "Opus") ||
+        containsAscii(moovSlice, "ac-3") ||
+        containsAscii(moovSlice, "ec-3");
+
+      if (mediaOffset !== -1 && mediaOffset > 0) {
+        return {
+          type: "combined",
+          initBytes: u8.slice(0, mediaOffset),
+          mediaBytes: u8.slice(mediaOffset),
+          hasAudio
+        };
+      }
+      return {
+        type: "pure_init",
+        initBytes: u8,
+        mediaBytes: null,
+        hasAudio
+      };
+    }
+
+    return {
+      type: "media",
+      initBytes: null,
+      mediaBytes: u8,
+      hasAudio: null
+    };
+  }
+
   function getBufferedRanges(sb) {
     const out = [];
     try {
@@ -42,7 +229,6 @@
   }
 
   // Diff before/after buffered ranges to find the newly appended segment's [start, end]
-  // Properly handles back-buffer eviction by matching overlapping ranges!
   function findAddedRange(prev, next) {
     if (!next || next.length === 0) return null;
     if (!prev || prev.length === 0) {
@@ -56,11 +242,9 @@
       for (let j = 0; j < prev.length; j++) {
         const [ps, pe] = prev[j];
         if (ps <= ne + 0.5 && pe >= ns - 0.5) {
-          // Segment appended to the end of this buffered range
           if (ne > pe + 0.08) {
             return { start: pe, end: ne };
           }
-          // Segment prepended to the start of this buffered range
           if (ns < ps - 0.08 && Math.abs(ne - pe) < 0.5) {
             return { start: ns, end: ps };
           }
@@ -85,29 +269,6 @@
     }
 
     return null;
-  }
-
-  // Detect MP4 init segment (ftyp / moov) or WebM EBML header
-  function isInitSegment(u8) {
-    if (!u8 || u8.length < 8) return false;
-    const limit = Math.min(u8.length - 4, 64);
-    for (let i = 4; i <= limit; i++) {
-      if (
-        (u8[i] === 0x66 && u8[i + 1] === 0x74 && u8[i + 2] === 0x79 && u8[i + 3] === 0x70) || // ftyp
-        (u8[i] === 0x6d && u8[i + 1] === 0x6f && u8[i + 2] === 0x6f && u8[i + 3] === 0x76)    // moov
-      ) {
-        for (let j = i + 4; j < Math.min(u8.length - 4, 4096); j++) {
-          if (u8[j] === 0x6d && u8[j + 1] === 0x6f && u8[j + 2] === 0x6f && u8[j + 3] === 0x66) {
-            return "combined";
-          }
-        }
-        return "pure_init";
-      }
-    }
-    if (u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3) {
-      return "pure_init";
-    }
-    return false;
   }
 
   const pendingBatches = [];
@@ -168,6 +329,7 @@
           mimeType,
           isDedicatedAudio,
           initChunk: null,
+          lastInitHasAudio: true,
           fragments: [],
           totalBytes: 0,
           batchStart: null,
@@ -176,7 +338,7 @@
         };
 
         function flushTracker() {
-          if (tracker.fragments.length === 0 || tracker.batchStart === null) {
+          if (tracker.fragments.length === 0 || tracker.batchStart === null || !tracker.initChunk) {
             tracker.fragments = [];
             tracker.totalBytes = 0;
             tracker.batchStart = null;
@@ -189,14 +351,7 @@
             return;
           }
 
-          const parts = [];
-          if (tracker.initChunk) {
-            parts.push(tracker.initChunk);
-          }
-          for (const f of tracker.fragments) {
-            parts.push(f);
-          }
-
+          const parts = [tracker.initChunk, ...tracker.fragments];
           const totalLen = parts.reduce((acc, p) => acc + p.byteLength, 0);
           const merged = new Uint8Array(totalLen);
           let offset = 0;
@@ -249,48 +404,59 @@
               const result = Reflect.apply(sbTarget, sbThis, sbArgs);
 
               if (clonedU8) {
-                const initType = isInitSegment(clonedU8);
-                if (initType === "pure_init") {
-                  tracker.initChunk = clonedU8;
-                } else {
-                  if (initType === "combined" && !tracker.initChunk) {
-                    tracker.initChunk = null;
+                const parsed = parseMp4Buffer(clonedU8);
+
+                if (parsed.type === "pure_init") {
+                  tracker.lastInitHasAudio = Boolean(parsed.hasAudio);
+                  if (parsed.hasAudio) {
+                    tracker.initChunk = parsed.initBytes;
                   }
-                  const onUpdateEnd = () => {
-                    try {
-                      const nextRanges = getBufferedRanges(sbThis);
-                      const added = findAddedRange(prevRanges, nextRanges);
+                } else {
+                  if (parsed.type === "combined") {
+                    tracker.lastInitHasAudio = Boolean(parsed.hasAudio);
+                    if (parsed.hasAudio && parsed.initBytes) {
+                      tracker.initChunk = parsed.initBytes;
+                    }
+                  }
 
-                      // If user seeked to a new disjoint time range, flush previous batch first
-                      if (added && tracker.batchEnd !== null && Math.abs(added.start - tracker.batchEnd) > 2.5) {
-                        flushTracker();
-                        tracker.hasFlushedFirst = false;
-                      }
+                  const mediaChunk = parsed.mediaBytes;
+                  // Skip video-only fragments when hls.js multiplexes separate init+moof onto one SourceBuffer
+                  if (mediaChunk && mediaChunk.byteLength > 0 && tracker.lastInitHasAudio) {
+                    const onUpdateEnd = () => {
+                      try {
+                        const nextRanges = getBufferedRanges(sbThis);
+                        const added = findAddedRange(prevRanges, nextRanges);
 
-                      tracker.fragments.push(clonedU8);
-                      tracker.totalBytes += clonedU8.byteLength;
-
-                      if (added) {
-                        if (tracker.batchStart === null) {
-                          tracker.batchStart = added.start;
-                        }
-                        tracker.batchEnd = Math.max(tracker.batchEnd ?? added.end, added.end);
-
-                        const batchDur = tracker.batchEnd - tracker.batchStart;
-
-                        // First batch after start/seek flushes immediately (~3.2s+); subsequent batches group ~7.5s (~2 segments)
-                        const shouldFlush =
-                          (!tracker.hasFlushedFirst && batchDur >= 3.2) ||
-                          (batchDur >= 7.2) ||
-                          (tracker.totalBytes >= 4000000);
-
-                        if (shouldFlush) {
+                        if (added && tracker.batchEnd !== null && Math.abs(added.start - tracker.batchEnd) > 2.5) {
                           flushTracker();
+                          tracker.hasFlushedFirst = false;
                         }
-                      }
-                    } catch (e) {}
-                  };
-                  sbThis.addEventListener("updateend", onUpdateEnd, { once: true });
+
+                        tracker.fragments.push(mediaChunk);
+                        tracker.totalBytes += mediaChunk.byteLength;
+
+                        if (added) {
+                          if (tracker.batchStart === null) {
+                            tracker.batchStart = added.start;
+                          }
+                          tracker.batchEnd = Math.max(tracker.batchEnd ?? added.end, added.end);
+
+                          const batchDur = tracker.batchEnd - tracker.batchStart;
+
+                          // First batch after start/seek flushes immediately (~3.2s+); subsequent batches group ~7.2s
+                          const shouldFlush =
+                            (!tracker.hasFlushedFirst && batchDur >= 3.2) ||
+                            (batchDur >= 7.2) ||
+                            (tracker.totalBytes >= 3500000);
+
+                          if (shouldFlush) {
+                            flushTracker();
+                          }
+                        }
+                      } catch (e) {}
+                    };
+                    sbThis.addEventListener("updateend", onUpdateEnd, { once: true });
+                  }
                 }
               }
 
@@ -306,5 +472,5 @@
     origAddSourceBuffer
   );
 
-  console.log("[Movie Voice] MSE Audio Hook v4.4 ready.");
+  console.log("[Movie Voice] MSE Audio & Subtitle Hook ready.");
 })();

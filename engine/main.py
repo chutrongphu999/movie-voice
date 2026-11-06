@@ -111,26 +111,6 @@ async def dub_audio_chunk(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/dub/hardsub")
-async def dub_hardsub(
-    file: UploadFile = File(...),
-    video_time: float = Form(0.0),
-    voice: str = Form("vi-VN-HoaiMyNeural"),
-    rate: int = Form(0),
-    pitch: int = Form(0)
-):
-    """Receives a cropped subtitle-band frame (JPEG), reads the burned-in subtitle and returns a voiced cue."""
-    try:
-        data = await file.read()
-        if not data:
-            return {"cues": []}
-        cues = await pipeline.process_hardsub_frame(data, video_time, voice=voice, rate=rate, pitch=pitch)
-        return {"cues": cues}
-    except Exception as e:
-        print(f"[Error in /api/dub/hardsub]: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/api/dub/subtitles")
 async def dub_subtitles(req: SubtitlesRequest):
     """
@@ -152,9 +132,9 @@ async def dub_subtitles(req: SubtitlesRequest):
 
 @app.get("/api/dub/voice/{audio_id}")
 async def get_dub_voice(audio_id: str):
-    """Streams synthesized MP3 audio chunk to the browser player."""
-    file_path = CACHE_DIR / f"{audio_id}.mp3"
-    if not file_path.exists():
+    """Streams synthesized MP3 audio chunk to the browser player (awaiting background TTS task if still in-flight)."""
+    file_path = await pipeline.get_or_wait_audio(audio_id)
+    if not file_path or not file_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
     return FileResponse(file_path, media_type="audio/mpeg", headers={"Cache-Control": "public, max-age=86400"})
 
@@ -165,7 +145,7 @@ async def get_settings():
         "groq_configured": bool(os.getenv("GROQ_API_KEY")),
         "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
         "default_voice": os.getenv("DEFAULT_VOICE", "vi-VN-HoaiMyNeural"),
-        "asr_model": os.getenv("ASR_MODEL", "whisper-large-v3-turbo"),
+        "asr_model": os.getenv("ASR_MODEL", "whisper-large-v3"),
         "translate_model": os.getenv("TRANSLATE_MODEL", "openai/gpt-oss-120b")
     }
 
@@ -179,12 +159,11 @@ async def update_settings(req: SettingsUpdate):
     if req.default_voice is not None:
         os.environ["DEFAULT_VOICE"] = req.default_voice.strip()
 
-    # Persist into .env
     lines = [
         f"GROQ_API_KEY={os.getenv('GROQ_API_KEY', '')}",
         f"GEMINI_API_KEY={os.getenv('GEMINI_API_KEY', '')}",
         f"DEFAULT_VOICE={os.getenv('DEFAULT_VOICE', 'vi-VN-HoaiMyNeural')}",
-        f"ASR_MODEL={os.getenv('ASR_MODEL', 'whisper-large-v3-turbo')}",
+        f"ASR_MODEL={os.getenv('ASR_MODEL', 'whisper-large-v3')}",
         f"TRANSLATE_MODEL={os.getenv('TRANSLATE_MODEL', 'openai/gpt-oss-120b')}",
     ]
     ENV_FILE.write_text("\n".join(lines), encoding="utf-8")

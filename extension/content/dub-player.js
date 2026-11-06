@@ -1,5 +1,6 @@
-// Movie Voice - In-Page Web Audio Dubbing Player v4.4
-// Uses a Playhead-Synchronized Lookahead Queue so MSE batches are always processed in chronological order right ahead of video.currentTime!
+// Movie Voice - In-Page Web Audio Dubbing Player
+// Strictly follows the Architecture Plan:
+// Priority 1/2: Soft subtitles (.vtt/.srt/textTracks/DOM) -> Priority 3: Pre-buffered MSE Audio Stream (never pauses video, never uses OCR)
 (function () {
   "use strict";
 
@@ -13,8 +14,7 @@
     voice: "vi-VN-HoaiMyNeural",
     ducking: 0.20,
     rate: 0,
-    pitch: 0,
-    mode: "audio" // "audio" = nghe tiếng gốc (Whisper) | "hardsub" = đọc chữ sub gắn cứng trên hình (Gemini Vision)
+    pitch: 0
   };
 
   if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.sync) {
@@ -92,52 +92,7 @@
   let restoreTimeout = null;
   let inFlightUploads = 0;
   let pendingMseBatches = [];
-
-  // Dub-ahead gating: pause video briefly so the AI stays ~12s ahead of the playhead (no more lag / stale cues)
-  let processedUpTo = 0;
-  let gateWindowStart = Date.now();
-  let autoPaused = false;
-  let autoPauseStartedAt = 0;
-  let lastGateEndedAt = 0;
-  const GATE_MIN_AHEAD = 5.0;
-  const GATE_RESUME_AHEAD = 12.0;
-
-  function resetGate(time) {
-    processedUpTo = time || 0;
-    gateWindowStart = Date.now();
-  }
-
-  setInterval(() => {
-    if (!config.enabled || !activeVideo || config.mode === "hardsub") return;
-    const t = activeVideo.currentTime;
-    const ahead = processedUpTo - t;
-    const gateActive = (Date.now() - gateWindowStart) < 40000;
-
-    if (autoPaused) {
-      const waited = Date.now() - autoPauseStartedAt;
-      if (ahead >= GATE_RESUME_AHEAD || waited > 25000 || !gateActive) {
-        autoPaused = false;
-        lastGateEndedAt = Date.now();
-        sendClientLog("GATE_RESUME", `ahead=${ahead.toFixed(1)}s waited=${(waited / 1000).toFixed(1)}s`);
-        activeVideo.play().catch(() => {});
-      } else {
-        setStatus(`⏳ Đang chuẩn bị lồng tiếng... (${Math.max(0, ahead).toFixed(0)}/${GATE_RESUME_AHEAD}s)`);
-      }
-      return;
-    }
-
-    if (
-      !activeVideo.paused &&
-      gateActive &&
-      ahead < GATE_MIN_AHEAD &&
-      Date.now() - lastGateEndedAt > 3000
-    ) {
-      autoPaused = true;
-      autoPauseStartedAt = Date.now();
-      activeVideo.pause();
-      sendClientLog("GATE_PAUSE", `video=${t.toFixed(1)}s processedUpTo=${processedUpTo.toFixed(1)}s`);
-    }
-  }, 300);
+  let hasSoftSubtitles = false;
 
   // Smart Ducking: smoothly lowers and restores original video volume
   function rampVideoVolume(targetVolume, durationMs = 180) {
@@ -335,7 +290,7 @@
     }
   }
 
-  // Scheduler loop: checks cueQueue every 80ms and keeps strict real-time lip-sync (no domino lag!)
+  // Scheduler loop: checks cueQueue every 80ms and plays lines in sync with video.currentTime
   setInterval(() => {
     if (!config.enabled || !activeVideo || activeVideo.paused || cueQueue.length === 0) {
       return;
@@ -343,22 +298,21 @@
 
     const currTime = activeVideo.currentTime;
 
-    // 1. Drop cues that have already passed (> 0.8s past cue.end or > 2.8s past cue.start) so we NEVER speak stale lines!
+    // 1. Drop cues that are too old (> 2.5s past cue.end or > 5.0s past cue.start)
     while (
       cueQueue.length > 0 &&
-      (currTime > cueQueue[0].end + 1.0 || currTime > cueQueue[0].start + 3.5)
+      (currTime > cueQueue[0].end + 2.5 || currTime > cueQueue[0].start + 5.0)
     ) {
       const dropped = cueQueue.shift();
       sendClientLog("CUE_SKIPPED_LATE", `Skipped stale ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s at video=${currTime.toFixed(1)}s`);
     }
     if (cueQueue.length === 0) return;
 
-    // 2. If multiple cues are already due (e.g. two short lines back-to-back), skip to the one matching currTime
-    while (cueQueue.length >= 2 && currTime >= cueQueue[1].start - 0.1) {
+    // 2. If multiple cues are already due, jump to the latest one matching currTime
+    while (cueQueue.length >= 2 && currTime >= cueQueue[1].start) {
       cueQueue.shift();
     }
 
-    // If currently speaking, check if the next cue is already overdue by >0.4s and cut off tail of old cue if needed
     if (isSpeaking) {
       if (cueQueue.length > 0 && currTime >= cueQueue[0].start + 0.6) {
         stopCurrentSpeechOnly();
@@ -369,11 +323,10 @@
 
     const nextCue = cueQueue[0];
 
-    // 3. Play when playhead reaches nextCue.start (with 0.25s pre-roll)
-    if (currTime >= nextCue.start - 0.25 && currTime <= nextCue.end + 0.8) {
+    // 3. Play when playhead reaches nextCue.start (with 0.3s pre-roll)
+    if (currTime >= nextCue.start - 0.3 && currTime <= nextCue.end + 2.5) {
       cueQueue.shift();
       let baseSpeed = 1.0 + (config.rate || 0) / 100;
-      // Time-fit: speed up slightly if TTS duration is longer than the available time window before the next cue
       const slotEnd = cueQueue.length > 0 ? Math.min(nextCue.end + 0.4, cueQueue[0].start) : (nextCue.end + 0.5);
       const availWindow = Math.max(1.0, slotEnd - Math.max(currTime, nextCue.start));
       const ttsDur = nextCue.duration || 2.0;
@@ -384,26 +337,24 @@
     }
   }, 80);
 
-  // Playhead-synchronized MSE Batch Scheduler:
-  // Always picks the earliest batch right at/ahead of activeVideo.currentTime (within +32s lookahead)
+  // Playhead-synchronized MSE Batch Scheduler (up to 3 concurrent requests within +42s lookahead)
   async function processNextMseBatch() {
-    if (config.mode === "hardsub") { pendingMseBatches = []; return; }
-    if (!config.enabled || inFlightUploads >= 2 || pendingMseBatches.length === 0) return;
+    if (!config.enabled || hasSoftSubtitles || inFlightUploads >= 3 || pendingMseBatches.length === 0) return;
 
     const currTime = activeVideo ? activeVideo.currentTime : 0;
 
     // 1. Prune batches that are far behind current playhead (> 60s old)
     pendingMseBatches = pendingMseBatches.filter((b) => b.endTime >= currTime - 60.0);
 
-    // 2. Sort ascending by startTime so we ALWAYS process earliest segments first!
+    // 2. Sort ascending by startTime so we ALWAYS process earliest segments first
     pendingMseBatches.sort((a, b) => a.startTime - b.startTime);
 
-    // 3. Find the earliest batch that covers current playhead or is within the next 32 seconds
+    // 3. Find the earliest batch that covers current playhead or is within the next 42 seconds
     let targetIdx = -1;
     for (let i = 0; i < pendingMseBatches.length; i++) {
       const b = pendingMseBatches[i];
       if (b.endTime >= currTime - 0.5) {
-        if (currTime === 0 || b.startTime <= currTime + 32.0) {
+        if (currTime === 0 || b.startTime <= currTime + 42.0) {
           targetIdx = i;
         }
         break;
@@ -411,7 +362,6 @@
     }
 
     if (targetIdx === -1) {
-      // All relevant batches within the next 32s are already processed; wait for playhead to advance
       return;
     }
 
@@ -419,7 +369,7 @@
 
     inFlightUploads++;
     if (!isSpeaking && cueQueue.length === 0) {
-      setStatus(`⚡ Đang dịch đoạn ${Math.floor(batch.startTime)}s...`);
+      setStatus(`⚡ Đang dịch trước đoạn ${Math.floor(batch.startTime)}s...`);
     }
 
     try {
@@ -472,129 +422,71 @@
       if (!isSpeaking) setStatus("Chưa kết nối Engine (run.bat)");
     } finally {
       inFlightUploads--;
-      if (batch && Number.isFinite(batch.endTime)) {
-        processedUpTo = Math.max(processedUpTo, batch.endTime);
-      }
       if (pendingMseBatches.length > 0) {
         processNextMseBatch();
       }
     }
   }
 
-  // Periodically check if video playhead has advanced into the 32s lookahead window of buffered MSE batches
   setInterval(() => {
-    if (config.enabled && pendingMseBatches.length > 0 && inFlightUploads < 2) {
+    if (config.enabled && !hasSoftSubtitles && pendingMseBatches.length > 0 && inFlightUploads < 3) {
       processNextMseBatch();
     }
-  }, 600);
+  }, 500);
 
-  // ---------- Hard-sub mode: read burned-in subtitle from the video frame (no OCR engine, Gemini Vision) ----------
-  const MASK_W = 160;
-  const MASK_H = 28;
-  const maskCanvas = document.createElement("canvas");
-  maskCanvas.width = MASK_W;
-  maskCanvas.height = MASK_H;
-  const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
-  const cropCanvas = document.createElement("canvas");
-  let hsPrevMask = null;      // mask of previous sample (to detect "stable" subtitle)
-  let hsSentMask = null;      // mask of the last subtitle we sent
-  let hsLastSendAt = 0;
-  let hsInFlight = false;
-  let hsWarnedTaint = false;
+  // Listen for MSE audio batches & intercepted .vtt/.srt subtitle files from mse-hook.js
+  let fullSubFileCues = [];
+  let lastSubBatchSentTo = -1;
 
-  // Subtitle band: bottom 28% of the frame, central 90% width
-  function cropRect(v) {
-    const w = v.videoWidth, h = v.videoHeight;
-    return { sx: Math.round(w * 0.05), sy: Math.round(h * 0.72), sw: Math.round(w * 0.9), sh: Math.round(h * 0.28) };
-  }
-
-  function sampleMask(v) {
-    const r = cropRect(v);
-    maskCtx.drawImage(v, r.sx, r.sy, r.sw, r.sh, 0, 0, MASK_W, MASK_H);
-    const px = maskCtx.getImageData(0, 0, MASK_W, MASK_H).data;
-    const mask = new Uint8Array(MASK_W * MASK_H);
-    let on = 0;
-    for (let i = 0, j = 0; i < px.length; i += 4, j++) {
-      const g = px[i] * 0.3 + px[i + 1] * 0.59 + px[i + 2] * 0.11;
-      if (g > 215) { mask[j] = 1; on++; }
+  function pumpSoftSubtitleFile() {
+    if (!config.enabled || !hasSoftSubtitles || fullSubFileCues.length === 0 || !activeVideo) return;
+    const curr = activeVideo.currentTime;
+    if (curr < lastSubBatchSentTo - 10.0 && curr >= 0 && lastSubBatchSentTo > curr + 30.0) {
+      // User seeked backward
+      lastSubBatchSentTo = curr - 1.0;
     }
-    return { mask, ratio: on / mask.length };
-  }
+    if (lastSubBatchSentTo >= curr + 20.0) return;
 
-  function maskDiff(a, b) {
-    if (!a || !b) return 1;
-    let x = 0, u = 0;
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] || b[i]) { u++; if (a[i] !== b[i]) x++; }
-    }
-    return u === 0 ? 0 : x / u;
-  }
+    const winStart = Math.max(curr - 0.5, lastSubBatchSentTo);
+    const winEnd = curr + 30.0;
+    const slice = fullSubFileCues.filter((c) => c.start >= winStart && c.start <= winEnd).slice(0, 12);
+    lastSubBatchSentTo = winEnd;
+    if (slice.length === 0) return;
 
-  async function sendHardsubFrame(v) {
-    const r = cropRect(v);
-    const outW = Math.min(720, r.sw);
-    cropCanvas.width = outW;
-    cropCanvas.height = Math.round(outW * r.sh / r.sw);
-    cropCanvas.getContext("2d").drawImage(v, r.sx, r.sy, r.sw, r.sh, 0, 0, cropCanvas.width, cropCanvas.height);
-    const dataUrl = cropCanvas.toDataURL("image/jpeg", 0.72);
-    const b64 = dataUrl.split(",")[1];
-    const videoTime = v.currentTime;
-    hsInFlight = true;
-    try {
-      const res = await new Promise((resolve) => {
-        chrome.runtime.sendMessage(
-          { type: "DUB_HARDSUB", imageB64: b64, videoTime, voice: config.voice, rate: config.rate, pitch: config.pitch },
-          (r2) => resolve(r2)
-        );
+    const sampleText = slice.map((c) => c.text).join(" ");
+    const isViet = /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(sampleText);
+
+    const payload = {
+      cues: slice,
+      voice: config.voice,
+      rate: config.rate,
+      pitch: config.pitch,
+      is_vietnamese: isViet
+    };
+    if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+      chrome.runtime.sendMessage({ type: "DUB_SUBTITLES", payload }, (res) => {
+        if (res && res.ok && res.cues) enqueueCues(res.cues);
       });
-      if (res && res.ok && res.cues && res.cues.length) {
-        // cue.start = time the subtitle appeared; speak as soon as it arrives
-        res.cues.forEach((c) => { c.start = Math.min(c.start, v.currentTime); });
-        enqueueCues(res.cues);
-      } else if (res && !res.ok && !isSpeaking) {
-        setStatus(`Lỗi Engine: ${String(res.error).slice(0, 40)}`);
-      }
-    } catch (e) {
-    } finally {
-      hsInFlight = false;
     }
   }
 
-  setInterval(() => {
-    if (!config.enabled || config.mode !== "hardsub" || !activeVideo || activeVideo.paused) return;
-    const v = activeVideo;
-    if (!v.videoWidth || v.readyState < 2) return;
-    let cur;
-    try {
-      cur = sampleMask(v);
-    } catch (e) {
-      if (!hsWarnedTaint) {
-        hsWarnedTaint = true;
-        sendClientLog("HARDSUB_CANVAS_BLOCKED", String(e));
-        setStatus("⚠️ Trang chặn đọc khung hình video");
-      }
-      return;
-    }
-    const present = cur.ratio > 0.004 && cur.ratio < 0.3;
-    const stable = present && hsPrevMask && maskDiff(hsPrevMask, cur.mask) < 0.25;
-    hsPrevMask = cur.mask;
+  setInterval(pumpSoftSubtitleFile, 1000);
 
-    if (!present) {
-      hsSentMask = null; // subtitle gone -> the next one counts as new
-      return;
-    }
-    if (!stable || hsInFlight) return;
-    if (Date.now() - hsLastSendAt < 1500) return;
-    if (hsSentMask && maskDiff(hsSentMask, cur.mask) < 0.4) return; // same subtitle already sent
-
-    hsSentMask = cur.mask;
-    hsLastSendAt = Date.now();
-    sendHardsubFrame(v);
-  }, 300);
-
-  // Listen for MSE audio batches from mse-hook.js
   window.addEventListener("message", (event) => {
-    if (!event.data || event.data.type !== "__MOVIE_VOICE_MSE_BATCH__" || !event.data.buffer) {
+    if (!event.data) return;
+
+    if (event.data.type === "__MOVIE_VOICE_SUBTITLE_FILE__" && Array.isArray(event.data.cues)) {
+      hasSoftSubtitles = true;
+      fullSubFileCues = event.data.cues;
+      lastSubBatchSentTo = -1;
+      pendingMseBatches = [];
+      sendClientLog("SOFT_SUB_FILE_DETECTED", `Loaded ${fullSubFileCues.length} cues from ${event.data.url || "stream"}`);
+      setStatus(`Đã nạp ${fullSubFileCues.length} câu phụ đề mềm`);
+      pumpSoftSubtitleFile();
+      return;
+    }
+
+    if (event.data.type !== "__MOVIE_VOICE_MSE_BATCH__" || !event.data.buffer || hasSoftSubtitles) {
       return;
     }
     const startTime = Number.isFinite(event.data.startTime)
@@ -611,7 +503,6 @@
       buffer: event.data.buffer
     });
 
-    // Sort by startTime ascending and cap at 45 batches (removing from the far future, NEVER removing near batches!)
     pendingMseBatches.sort((a, b) => a.startTime - b.startTime);
     if (pendingMseBatches.length > 45) {
       pendingMseBatches.pop();
@@ -620,7 +511,6 @@
     processNextMseBatch();
   });
 
-  // Notify mse-hook.js that dub-player.js is ready to receive batches
   window.postMessage({ type: "__MOVIE_VOICE_PLAYER_READY__" }, "*");
 
   // UI elements
@@ -641,10 +531,6 @@
       btn.innerText = config.enabled ? "🎙️ LỒNG TIẾNG: BẬT" : "🎙️ LỒNG TIẾNG: TẮT";
       btn.classList.toggle("active", Boolean(config.enabled));
     }
-    const modeBtn = uiContainer.querySelector(".mv-mode-btn");
-    if (modeBtn) {
-      modeBtn.innerText = config.mode === "hardsub" ? "📝 Đọc sub trên hình" : "🔊 Nghe tiếng gốc";
-    }
   }
 
   function mountUI(video) {
@@ -653,26 +539,8 @@
     uiContainer.className = "movie-voice-floating-bar";
     uiContainer.innerHTML = `
       <button class="mv-toggle-btn ${config.enabled ? 'active' : ''}">🎙️ LỒNG TIẾNG: BẬT</button>
-      <button class="mv-mode-btn">🔊 Nghe tiếng gốc</button>
       <span class="mv-status-text">Sẵn sàng</span>
     `;
-
-    uiContainer.querySelector(".mv-mode-btn").addEventListener("click", (e) => {
-      e.stopPropagation();
-      getAudioContext();
-      config.mode = config.mode === "hardsub" ? "audio" : "hardsub";
-      cueQueue = [];
-      stopCurrentSpeechOnly();
-      autoPaused = false;
-      hsSentMask = null;
-      hsPrevMask = null;
-      if (config.mode === "audio") resetGate(activeVideo ? activeVideo.currentTime : 0);
-      if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.sync) {
-        chrome.storage.sync.set({ mode: config.mode });
-      }
-      setStatus(config.mode === "hardsub" ? "Đang đọc sub trên hình..." : "Đang nghe tiếng gốc...");
-      updateUI();
-    });
 
     uiContainer.querySelector(".mv-toggle-btn").addEventListener("click", (e) => {
       e.stopPropagation();
@@ -704,37 +572,28 @@
     video.addEventListener("play", () => {
       getAudioContext();
       processNextMseBatch();
+      pumpSoftSubtitleFile();
     });
 
     video.addEventListener("pause", () => {
       if (video === activeVideo) {
-        // Only the user's own pause stops speech; our gate pause keeps queued cues intact
-        if (!autoPaused) stopCurrentSpeechOnly();
-      }
-    });
-
-    video.addEventListener("play", () => {
-      // User pressed play manually while gate was holding: release gate
-      if (video === activeVideo && autoPaused && Date.now() - autoPauseStartedAt > 800) {
-        autoPaused = false;
-        lastGateEndedAt = Date.now();
+        stopCurrentSpeechOnly();
       }
     });
 
     video.addEventListener("seeking", () => {
       if (video === activeVideo) {
         stopCurrentSpeechOnly();
-        cueQueue = [];
-        autoPaused = false;
-        resetGate(video.currentTime);
         setStatus("Đang đồng bộ vị trí mới...");
       }
     });
 
     video.addEventListener("seeked", () => {
       if (video === activeVideo) {
+        lastSubBatchSentTo = video.currentTime - 0.5;
         sendClientLog("VIDEO_SEEKED", `currentTime=${video.currentTime.toFixed(1)}s, queuedBatches=${pendingMseBatches.length}`);
         processNextMseBatch();
+        pumpSoftSubtitleFile();
       }
     });
   }
@@ -743,7 +602,6 @@
   new window.MovieVoiceDetector(
     (video) => {
       activeVideo = video;
-      resetGate(video.currentTime || 0);
       bindVideoEvents(video);
       mountUI(video);
       sendClientLog("VIDEO_DETECTED", `duration=${(video.duration || 0).toFixed(1)}s, currentTime=${(video.currentTime || 0).toFixed(1)}s`);
@@ -751,14 +609,15 @@
       processNextMseBatch();
     },
     async (sub) => {
-      // Soft subtitle detected
       if (!config.enabled || !activeVideo) return;
+      hasSoftSubtitles = true;
+      const isViet = /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(sub.text);
       const payload = {
         cues: [{ start: sub.start, end: sub.end, text: sub.text }],
         voice: config.voice,
         rate: config.rate,
         pitch: config.pitch,
-        is_vietnamese: true
+        is_vietnamese: isViet
       };
       try {
         if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
