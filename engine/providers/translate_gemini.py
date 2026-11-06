@@ -1,13 +1,23 @@
-"""Batch Subtitle Translator using Gemini (with Groq LLM fallback).
+"""Batch Subtitle Translator using Groq Fast LLMs, Gemini, and Google Translate fallback.
 Inspired by llm-subtrans for strict 1-to-1 line correspondence and context retention.
 """
 import os
 import re
-import json
 import asyncio
-from typing import List, Dict, Any
+import urllib.parse
+from typing import List
 import aiohttp
 import groq
+
+GROQ_MODELS = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+]
+
+GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+]
 
 
 class Translator:
@@ -15,8 +25,8 @@ class Translator:
         self,
         gemini_key: str = None,
         groq_key: str = None,
-        gemini_model: str = "gemini-2.5-flash-lite",
-        groq_model: str = "llama-3.3-70b-versatile"
+        gemini_model: str = "gemini-3.1-flash-lite",
+        groq_model: str = "openai/gpt-oss-120b"
     ):
         self.gemini_key = gemini_key or os.getenv("GEMINI_API_KEY", "")
         self.groq_key = groq_key or os.getenv("GROQ_API_KEY", "")
@@ -38,7 +48,7 @@ class Translator:
             "Quy tắc dịch:\n"
             "1. Dịch tự nhiên, ngắn gọn, súc tích, giữ đúng văn phong thoại đời thường để diễn viên lồng tiếng nói kịp thời gian.\n"
             "2. Xưng hô chuẩn theo bối cảnh phim (ví dụ: tôi/bạn, anh/em, cậu/tớ, ta/ngươi).\n"
-            "3. Bắt buộc giữ nguyên số lượng dòng và mã số thứ tự #1, #2... tương ứng.\n"
+            "3. Bắt buộc giữ nguyên số lượng dòng và mã số thứ tự #1, #2... tương ứng. Không giải thích thêm.\n"
             "4. Định dạng trả về duy nhất cho mỗi dòng:\n"
             "#{số thứ tự} Translation> {câu tiếng Việt}\n\n"
         )
@@ -59,71 +69,107 @@ class Translator:
             if m:
                 idx = int(m.group(1))
                 text = m.group(2).strip()
-                # Clean up any trailing / leading artifacts
-                text = re.sub(r"^Translation[:>]?\s*", "", text, flags=re.IGNORECASE)
-                translations[idx] = text
+                text = re.sub(r"^Translation[:>]?\s*", "", text, flags=re.IGNORECASE).strip()
+                if text:
+                    translations[idx] = text
+
+        if not translations:
+            raise RuntimeError("No valid #N lines parsed from LLM response")
 
         results = []
         for i in range(1, expected_count + 1):
             results.append(translations.get(i, fallback_lines[i - 1]))
         return results
 
-    async def _translate_gemini(self, prompt: str) -> str:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
-        }
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.post(url, headers={"x-goog-api-key": self.gemini_key}, json=payload) as resp:
-                if resp.status != 200:
-                    err_msg = await resp.text()
-                    raise RuntimeError(f"Gemini error HTTP {resp.status}: {err_msg[:200]}")
-                data = await resp.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-
-    async def _translate_groq(self, prompt: str) -> str:
+    async def _translate_groq(self, prompt: str, model_name: str) -> str:
         if not self.groq_client:
             raise RuntimeError("No Groq client configured")
 
         def _call():
             chat = self.groq_client.chat.completions.create(
                 messages=[
-                    {"role": "system", "content": "You are an expert movie dubbing translator into Vietnamese."},
+                    {"role": "system", "content": "You are an expert movie dubbing translator into Vietnamese. Output only the requested #N Translation> lines."},
                     {"role": "user", "content": prompt}
                 ],
-                model=self.groq_model,
+                model=model_name,
                 temperature=0.2,
-                max_tokens=2048
+                max_tokens=1500
             )
-            return chat.choices[0].message.content
+            return chat.choices[0].message.content or ""
 
-        return await asyncio.to_thread(_call)
+        return await asyncio.wait_for(asyncio.to_thread(_call), timeout=6.0)
+
+    async def _translate_gemini(self, prompt: str, model_name: str) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500}
+        }
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6.0)) as session:
+            async with session.post(url, headers={"x-goog-api-key": self.gemini_key}, json=payload) as resp:
+                if resp.status != 200:
+                    err_msg = await resp.text()
+                    raise RuntimeError(f"Gemini {model_name} HTTP {resp.status}: {err_msg[:120]}")
+                data = await resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    async def _translate_google_free(self, lines: List[str]) -> List[str]:
+        """Ultra-reliable fallback using Google Translate GTX endpoint."""
+        joined = "\n".join(lines)
+        q = urllib.parse.quote(joined)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=vi&dt=t&q={q}"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4.0)) as session:
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Google Translate HTTP {resp.status}")
+                data = await resp.json(content_type=None)
+                full_text = "".join(part[0] for part in data[0] if part and part[0])
+                split_lines = [s.strip() for s in full_text.splitlines() if s.strip()]
+                if len(split_lines) == len(lines):
+                    return split_lines
+                # If line count mismatched, translate individually in parallel
+                tasks = [self._translate_google_single(session, l) for l in lines]
+                return await asyncio.gather(*tasks)
+
+    async def _translate_google_single(self, session: aiohttp.ClientSession, text: str) -> str:
+        q = urllib.parse.quote(text)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=vi&dt=t&q={q}"
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                return "".join(part[0] for part in data[0] if part and part[0]).strip()
+        return text
 
     async def translate_batch(self, lines: List[str], context_hint: str = "") -> List[str]:
-        """Translates a batch of lines into Vietnamese with fallback."""
+        """Translates a batch of lines into Vietnamese with multi-tier fast fallback."""
         if not lines:
             return []
 
-        # If already Vietnamese or empty, return as is
         clean_lines = [l.strip() for l in lines]
         prompt = self._build_batch_prompt(clean_lines, context_hint)
 
-        # 1. Try Gemini first
-        if self.gemini_key:
-            try:
-                resp = await self._translate_gemini(prompt)
-                return self._parse_batch_response(resp, len(lines), clean_lines)
-            except Exception as e:
-                print(f"[Translator] Gemini translation failed ({e}), falling back to Groq...")
-
-        # 2. Fallback to Groq LLM
+        # 1. Try Groq fast LLM models first (~0.25s latency, high rate limit)
         if self.groq_key:
-            try:
-                resp = await self._translate_groq(prompt)
-                return self._parse_batch_response(resp, len(lines), clean_lines)
-            except Exception as e:
-                print(f"[Translator] Groq LLM translation failed: {e}")
+            for model in GROQ_MODELS:
+                try:
+                    resp = await self._translate_groq(prompt, model)
+                    return self._parse_batch_response(resp, len(lines), clean_lines)
+                except Exception as e:
+                    print(f"[Translator] Groq {model} skipped ({e})")
 
-        # If all fail, return original lines
+        # 2. Try Gemini models
+        if self.gemini_key:
+            for model in GEMINI_MODELS:
+                try:
+                    resp = await self._translate_gemini(prompt, model)
+                    return self._parse_batch_response(resp, len(lines), clean_lines)
+                except Exception as e:
+                    print(f"[Translator] Gemini {model} skipped ({e})")
+
+        # 3. Guaranteed fallback to Google Translate GTX
+        try:
+            return await self._translate_google_free(clean_lines)
+        except Exception as e:
+            print(f"[Translator] Google Translate fallback failed: {e}")
+
         return clean_lines

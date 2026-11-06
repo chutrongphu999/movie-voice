@@ -264,10 +264,12 @@
                         ? (tracker.batchEnd - tracker.batchStart)
                         : 0;
 
-                      // Flush immediately on first segment (~4s+) for fast startup, or every ~8s / 90KB afterwards
-                      const shouldFlush = (!tracker.hasFlushedFirst && (batchDur >= 3.5 || tracker.totalBytes >= 45000)) ||
-                                          (batchDur >= 8.0) ||
-                                          (tracker.totalBytes >= 110000);
+                      // Flush first batch quickly (~3.5s+), then batch 2-3 segments (~9s+) to avoid flooding Engine on muxed streams
+                      const shouldFlush =
+                        (!tracker.hasFlushedFirst && (batchDur >= 3.5 || tracker.fragments.length >= 2)) ||
+                        (batchDur >= 9.0) ||
+                        (tracker.fragments.length >= 3) ||
+                        (tracker.totalBytes >= 3500000);
 
                       if (shouldFlush) {
                         flushTracker();

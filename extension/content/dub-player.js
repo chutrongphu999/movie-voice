@@ -1,4 +1,4 @@
-// Movie Voice - In-Page Web Audio Dubbing Player v4.1
+// Movie Voice - In-Page Web Audio Dubbing Player v4.2
 // Receives MSE audio batches & soft subtitles, prefetches TTS audio, and schedules non-overlapping dubbing with Smart Ducking
 (function () {
   "use strict";
@@ -28,6 +28,16 @@
       if (!config.enabled) stopAllSpeech();
       updateUI();
     });
+  }
+
+  function sendClientLog(event, detail) {
+    try {
+      if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+        chrome.runtime.sendMessage({ type: "CLIENT_LOG", event, detail }, () => {
+          void chrome.runtime.lastError;
+        });
+      }
+    } catch (e) {}
   }
 
   // AudioContext for low-latency playback (exempt from page media-src CSP)
@@ -156,18 +166,25 @@
   }
 
   // Fetch voice audio bytes via background worker (or direct fetch fallback)
-  async function fetchVoiceArrayBuffer(audioUrl) {
+  async function fetchVoicePayload(audioUrl) {
     if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
       const res = await new Promise((resolve) => {
         chrome.runtime.sendMessage({ type: "FETCH_VOICE_AUDIO", audioUrl }, (r) => resolve(r));
       });
       if (res && res.ok && res.b64) {
-        return base64ToArrayBuffer(res.b64);
+        return {
+          b64: res.b64,
+          arrayBuf: base64ToArrayBuffer(res.b64)
+        };
       }
     }
     const resp = await fetch(`${ENGINE_URL}${audioUrl}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    return await resp.arrayBuffer();
+    const arrayBuf = await resp.arrayBuffer();
+    return {
+      b64: arrayBufferToBase64(arrayBuf),
+      arrayBuf
+    };
   }
 
   // Enqueue cues and immediately prefetch their audio bytes
@@ -184,8 +201,8 @@
       }
 
       // Prefetch audio immediately so it's ready in memory before cue.start
-      cue.audioPromise = fetchVoiceArrayBuffer(cue.audio_url).catch((err) => {
-        console.warn("[Movie Voice] Prefetch voice failed:", err);
+      cue.audioPromise = fetchVoicePayload(cue.audio_url).catch((err) => {
+        sendClientLog("PREFETCH_ERR", String(err));
         return null;
       });
       cueQueue.push(cue);
@@ -198,14 +215,14 @@
     }
   }
 
-  // Play a single cue using Web Audio API (with HTML5 Audio fallback)
+  // Play a single cue using Web Audio API (with data: URL HTML5 Audio fallback)
   async function playCueNow(cue, playbackRate = 1.0) {
     if (!config.enabled || !activeVideo || activeVideo.paused) return;
     isSpeaking = true;
 
     try {
-      const arrayBuf = await (cue.audioPromise || fetchVoiceArrayBuffer(cue.audio_url));
-      if (!arrayBuf || !config.enabled || !activeVideo || activeVideo.paused) {
+      const payload = await (cue.audioPromise || fetchVoicePayload(cue.audio_url));
+      if (!payload || !payload.arrayBuf || !config.enabled || !activeVideo || activeVideo.paused) {
         isSpeaking = false;
         return;
       }
@@ -214,39 +231,53 @@
       applyDucking();
 
       const ctx = getAudioContext();
+      if (ctx && ctx.state === "suspended") {
+        await Promise.race([
+          ctx.resume().catch(() => {}),
+          new Promise((r) => setTimeout(r, 250))
+        ]);
+      }
+
+      let playedViaWebAudio = false;
       if (ctx && ctx.state === "running") {
-        const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
-        await new Promise((resolve) => {
-          const source = ctx.createBufferSource();
-          source.buffer = decoded;
-          source.playbackRate.value = playbackRate;
-          source.connect(ctx.destination);
-          currentSourceNode = source;
-          source.onended = () => {
-            currentSourceNode = null;
-            resolve();
-          };
-          source.start(0);
-        });
-      } else {
-        // Fallback to HTML5 Audio element if AudioContext is still suspended
-        const blob = new Blob([arrayBuf], { type: "audio/mpeg" });
-        const blobUrl = URL.createObjectURL(blob);
         try {
-          await new Promise((resolve, reject) => {
-            fallbackAudioEl.src = blobUrl;
-            fallbackAudioEl.playbackRate = playbackRate;
-            fallbackAudioEl.onended = () => resolve();
-            fallbackAudioEl.onerror = (e) => reject(e);
-            fallbackAudioEl.play().catch(reject);
+          const decoded = await ctx.decodeAudioData(payload.arrayBuf.slice(0));
+          playedViaWebAudio = true;
+          sendClientLog("PLAY_OK (WebAudio)", `${cue.start.toFixed(1)}s (video=${activeVideo.currentTime.toFixed(1)}s) | "${cue.text}"`);
+          await new Promise((resolve) => {
+            const source = ctx.createBufferSource();
+            source.buffer = decoded;
+            source.playbackRate.value = playbackRate;
+            source.connect(ctx.destination);
+            currentSourceNode = source;
+            source.onended = () => {
+              currentSourceNode = null;
+              resolve();
+            };
+            source.start(0);
           });
-        } finally {
-          URL.revokeObjectURL(blobUrl);
+        } catch (webAudioErr) {
+          sendClientLog("WEBAUDIO_ERR", String(webAudioErr));
         }
       }
+
+      if (!playedViaWebAudio) {
+        // Fallback to HTML5 Audio element using data: URL (bypasses blob: CSP restrictions)
+        const dataUrl = `data:audio/mpeg;base64,${payload.b64}`;
+        sendClientLog("PLAY_FALLBACK (HTML5Audio)", `${cue.start.toFixed(1)}s (ctx=${ctx ? ctx.state : 'none'}) | "${cue.text}"`);
+        await new Promise((resolve, reject) => {
+          fallbackAudioEl.src = dataUrl;
+          fallbackAudioEl.playbackRate = playbackRate;
+          fallbackAudioEl.onended = () => resolve();
+          fallbackAudioEl.onerror = (e) => reject(new Error("HTML5 Audio error"));
+          fallbackAudioEl.play().catch(reject);
+        });
+      }
     } catch (err) {
+      const errMsg = err && err.name ? `${err.name}: ${err.message}` : String(err);
+      sendClientLog("PLAY_FAILED", `${cue.start.toFixed(1)}s | ${errMsg}`);
       if (err && err.name === "NotAllowedError") {
-        setStatus("🔊 Bấm vào khung video để cho phép âm thanh");
+        setStatus("🔊 Bấm 1 lần vào video để mở khóa tiếng!");
       } else {
         console.warn("[Movie Voice] Playback error:", err);
       }
@@ -264,22 +295,23 @@
 
     const currTime = activeVideo.currentTime;
 
-    // 1. Drop cues that are too old (ended more than 7s ago) or way in the past after a seek
-    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 7.0) {
-      cueQueue.shift();
+    // 1. Drop cues that are too old (ended more than 16s ago) or way in the past after a seek
+    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 16.0) {
+      const dropped = cueQueue.shift();
+      sendClientLog("CUE_EXPIRED", `Cue ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s dropped at video=${currTime.toFixed(1)}s`);
     }
     if (cueQueue.length === 0) return;
 
     const nextCue = cueQueue[0];
 
-    // 2. If the next cue is due now (or arrived slightly late within the 7s grace window), play it!
-    if (currTime >= nextCue.start - 0.25) {
+    // 2. If the next cue is due now (or arrived slightly late within the 16s grace window), play it!
+    if (currTime >= nextCue.start - 0.35) {
       cueQueue.shift();
       // Speed up slightly if we are catching up or if more cues are waiting right behind
       let speed = 1.0 + (config.rate || 0) / 100;
       const lag = currTime - nextCue.start;
       if (lag > 1.5 || cueQueue.length >= 2) {
-        speed = Math.min(1.28, Math.max(speed, 1.15));
+        speed = Math.min(1.30, Math.max(speed, 1.15));
       }
       playCueNow(nextCue, Math.max(0.8, Math.min(1.35, speed)));
     }
@@ -291,7 +323,7 @@
 
     const batch = pendingMseBatches.shift();
     // If activeVideo has already moved far past this batch, skip it
-    if (activeVideo && activeVideo.currentTime > batch.endTime + 6.0 && batch.endTime > 0) {
+    if (activeVideo && activeVideo.currentTime > batch.endTime + 10.0 && batch.endTime > 0) {
       return;
     }
 
@@ -467,6 +499,7 @@
       activeVideo = video;
       bindVideoEvents(video);
       mountUI(video);
+      sendClientLog("VIDEO_DETECTED", `duration=${(video.duration || 0).toFixed(1)}s, currentTime=${(video.currentTime || 0).toFixed(1)}s`);
       // Re-signal ready in case video was dynamically created
       window.postMessage({ type: "__MOVIE_VOICE_PLAYER_READY__" }, "*");
     },

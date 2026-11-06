@@ -102,5 +102,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === "CLIENT_LOG") {
+    fetch(`${DEFAULT_ENGINE}/api/dub/client-log`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ event: msg.event || "LOG", detail: msg.detail || "" })
+    }).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
+  }
+
   return false;
 });

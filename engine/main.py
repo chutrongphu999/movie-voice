@@ -11,8 +11,8 @@ if hasattr(sys.stdout, "reconfigure"):
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_FILE)
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -54,6 +54,11 @@ class SettingsUpdate(BaseModel):
     default_voice: Optional[str] = None
 
 
+class ClientLogItem(BaseModel):
+    event: str
+    detail: Optional[str] = ""
+
+
 @app.get("/api/health")
 async def health_check():
     groq_ok = bool(os.getenv("GROQ_API_KEY", "").strip())
@@ -65,6 +70,13 @@ async def health_check():
         "active_voice": os.getenv("DEFAULT_VOICE", "vi-VN-HoaiMyNeural"),
         "cached_audio_count": len(list(CACHE_DIR.glob("*.mp3")))
     }
+
+
+@app.post("/api/dub/client-log")
+async def client_log(item: ClientLogItem):
+    """Prints browser dubbing playback events directly to the Engine terminal for easy debugging."""
+    print(f"[Browser] {item.event} | {item.detail}")
+    return {"ok": True}
 
 
 @app.post("/api/dub/audio")
@@ -96,7 +108,6 @@ async def dub_audio_chunk(
         import traceback
         print(f"[Error in /api/dub/audio]: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -135,7 +146,7 @@ async def get_settings():
         "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
         "default_voice": os.getenv("DEFAULT_VOICE", "vi-VN-HoaiMyNeural"),
         "asr_model": os.getenv("ASR_MODEL", "whisper-large-v3-turbo"),
-        "translate_model": os.getenv("TRANSLATE_MODEL", "gemini-2.5-flash-lite")
+        "translate_model": os.getenv("TRANSLATE_MODEL", "openai/gpt-oss-120b")
     }
 
 
@@ -154,7 +165,7 @@ async def update_settings(req: SettingsUpdate):
         f"GEMINI_API_KEY={os.getenv('GEMINI_API_KEY', '')}",
         f"DEFAULT_VOICE={os.getenv('DEFAULT_VOICE', 'vi-VN-HoaiMyNeural')}",
         f"ASR_MODEL={os.getenv('ASR_MODEL', 'whisper-large-v3-turbo')}",
-        f"TRANSLATE_MODEL={os.getenv('TRANSLATE_MODEL', 'gemini-2.5-flash-lite')}",
+        f"TRANSLATE_MODEL={os.getenv('TRANSLATE_MODEL', 'openai/gpt-oss-120b')}",
     ]
     ENV_FILE.write_text("\n".join(lines), encoding="utf-8")
     pipeline.reload_config()

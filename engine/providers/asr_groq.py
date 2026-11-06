@@ -1,6 +1,8 @@
-"""Groq Whisper ASR Provider for fast, accurate speech-to-text with timestamps."""
-import io
+"""Groq Whisper ASR Provider for fast, accurate speech-to-text with timestamps and anti-hallucination filters."""
+import array
+import math
 import os
+import re
 import subprocess
 import asyncio
 from typing import List, Dict, Any
@@ -8,6 +10,68 @@ import imageio_ffmpeg
 import groq
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+
+# Known Whisper hallucinations on background music / silence chunks
+HALLUCINATION_PHRASES = {
+    "thank you",
+    "thanks for watching",
+    "thank you for watching",
+    "thanks",
+    "thank you very much",
+    "you",
+    "the",
+    "a",
+    "i",
+    "bye",
+    "bye bye",
+    "goodbye",
+    "see you next time",
+    "subtitles by",
+    "amara.org",
+    "please subscribe",
+    "subscribe",
+    "cảm ơn",
+    "cảm ơn các bạn đã theo dõi",
+    "hãy đăng ký kênh",
+}
+
+
+def compute_pcm_rms(wav_bytes: bytes) -> float:
+    """Computes RMS amplitude of 16-bit PCM WAV data (skipping 44-byte header)."""
+    if len(wav_bytes) <= 44:
+        return 0.0
+    pcm = wav_bytes[44:]
+    # Ensure even byte length for int16
+    if len(pcm) % 2 != 0:
+        pcm = pcm[:-1]
+    if not pcm:
+        return 0.0
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    # Sample every 16th frame for speed
+    step = 16
+    subset = samples[::step]
+    if not subset:
+        return 0.0
+    sum_sq = sum(s * s for s in subset)
+    return math.sqrt(sum_sq / len(subset))
+
+
+def is_hallucination_text(text: str, duration: float) -> bool:
+    """Checks if a transcribed segment is a known Whisper silence/music hallucination."""
+    cleaned = re.sub(r"[^\w\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", "", text.lower()).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned or len(cleaned) <= 1:
+        return True
+    if cleaned in HALLUCINATION_PHRASES:
+        return True
+    if "amara.org" in text.lower() or "subtitles by" in text.lower():
+        return True
+    # Single or two-word phrase stretched across > 8 seconds is always a music hallucination
+    word_count = len(cleaned.split())
+    if duration > 8.0 and word_count <= 2:
+        return True
+    return False
 
 
 class GroqASR:
@@ -51,43 +115,61 @@ class GroqASR:
 
     async def transcribe(self, audio_bytes: bytes, time_offset: float = 0.0) -> List[Dict[str, Any]]:
         """
-        Transcribes audio bytes and returns segments with absolute timestamps.
+        Transcribes audio bytes and returns segments with clamped timestamps and hallucination filtering.
         Each cue: {"start": float, "end": float, "text": str}
         """
         if not self.client:
             raise RuntimeError("Chưa cấu hình GROQ_API_KEY trong engine/.env!")
 
-        # Convert input buffer to clean WAV
         try:
             wav_bytes = await self.convert_to_wav(audio_bytes)
         except Exception as e:
-            print(f"[ASR Warning] Chunk cannot be decoded by FFmpeg yet (likely missing init segment or keyframe): {e}")
+            print(f"[ASR Warning] Chunk cannot be decoded by FFmpeg yet: {e}")
             return []
 
-        if len(wav_bytes) < 1000:
+        if len(wav_bytes) < 3200:
+            return []
+
+        # 16kHz * 1 channel * 2 bytes/sample = 32000 bytes per second
+        wav_duration = max(0.3, (len(wav_bytes) - 44) / 32000.0)
+
+        # Skip near-silent chunks before calling Whisper API
+        rms = compute_pcm_rms(wav_bytes)
+        if rms < 55.0:
             return []
 
         def _call_groq():
-            # Groq audio file upload
-            response = self.client.audio.transcriptions.create(
+            return self.client.audio.transcriptions.create(
                 file=("chunk.wav", wav_bytes),
                 model=self.model,
                 response_format="verbose_json",
                 temperature=0.0
             )
-            return response
 
         result = await asyncio.to_thread(_call_groq)
         cues = []
         segments = getattr(result, "segments", []) or []
 
         for seg in segments:
-            # Handle both dict-like and object-like segment attributes
-            start = float(seg.get("start", 0.0) if isinstance(seg, dict) else getattr(seg, "start", 0.0))
-            end = float(seg.get("end", 0.0) if isinstance(seg, dict) else getattr(seg, "end", 0.0))
-            text = (seg.get("text", "") if isinstance(seg, dict) else getattr(seg, "text", "")).strip()
+            is_dict = isinstance(seg, dict)
+            start = float(seg.get("start", 0.0) if is_dict else getattr(seg, "start", 0.0))
+            end = float(seg.get("end", 0.0) if is_dict else getattr(seg, "end", 0.0))
+            text = (seg.get("text", "") if is_dict else getattr(seg, "text", "")).strip()
+            no_speech_prob = float(
+                seg.get("no_speech_prob", 0.0) if is_dict else getattr(seg, "no_speech_prob", 0.0)
+            )
 
-            if not text or (end - start) < 0.2:
+            # Drop high no_speech_prob or segments starting past actual audio length
+            if no_speech_prob > 0.65 or start >= wav_duration - 0.15:
+                continue
+
+            # Clamp end timestamp to actual WAV duration so Whisper never invents 30s cues
+            end = min(end, wav_duration + 0.25)
+            seg_dur = end - start
+            if not text or seg_dur < 0.2:
+                continue
+
+            if is_hallucination_text(text, seg_dur):
                 continue
 
             cues.append({
