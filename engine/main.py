@@ -46,6 +46,7 @@ class SubtitlesRequest(BaseModel):
     rate: Optional[int] = 0
     pitch: Optional[int] = 0
     is_vietnamese: Optional[bool] = True
+    movie_title: Optional[str] = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -85,7 +86,8 @@ async def dub_audio_chunk(
     time_offset: float = Form(0.0),
     voice: str = Form("vi-VN-HoaiMyNeural"),
     rate: int = Form(0),
-    pitch: int = Form(0)
+    pitch: int = Form(0),
+    movie_title: str = Form("")
 ):
     """
     Receives an audio chunk (WAV, MP3, AAC, WebM, MP4) captured by the browser extension
@@ -101,7 +103,8 @@ async def dub_audio_chunk(
             time_offset=time_offset,
             voice=voice,
             rate=rate,
-            pitch=pitch
+            pitch=pitch,
+            movie_title=movie_title
         )
         return {"cues": cues}
     except Exception as e:
@@ -123,7 +126,8 @@ async def dub_subtitles(req: SubtitlesRequest):
             voice=req.voice,
             rate=req.rate,
             pitch=req.pitch,
-            is_vietnamese=req.is_vietnamese
+            is_vietnamese=req.is_vietnamese,
+            movie_title=req.movie_title or ""
         )
         return {"cues": cues}
     except Exception as e:

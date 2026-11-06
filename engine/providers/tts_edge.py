@@ -1,12 +1,18 @@
-"""High quality Vietnamese Text-To-Speech using Edge TTS with Google TTS fallback & persistent cache."""
+"""High quality Vietnamese Text-To-Speech using Edge TTS with FFmpeg silence trimming, exact duration & cache.
+Inspired by real-time-video-subs (rtsubs) & LocalDub for zero dead-air and exact slot time-fitting.
+"""
 import re
 import hashlib
 import asyncio
+import subprocess
 import urllib.parse
 from pathlib import Path
 from typing import Tuple, Dict, List
 import aiohttp
 import edge_tts
+import imageio_ffmpeg
+
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "audio"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -22,7 +28,10 @@ DEFAULT_VOICES = {
 
 
 def clean_text_for_speech(text: str) -> str:
-    """Cleans subtitle formatting, HTML tags, and sound indicators."""
+    """
+    Cleans subtitle formatting, HTML tags, sound indicators, and trailing commas
+    (from rtsubs/translate.py _clean: never end on a dangling comma so TTS reads a complete clause).
+    """
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", text)
@@ -34,15 +43,59 @@ def clean_text_for_speech(text: str) -> str:
         "",
         text
     )
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip().strip("\"“”")
+    text = re.sub(r"[,;:，；：、\s]+$", "", text)
+    if text and text[-1].isalnum():
+        text += "."
     return text
 
 
-def estimate_mp3_duration(audio_bytes: bytes) -> float:
-    """Estimates MP3 duration in seconds from byte size."""
-    if not audio_bytes:
-        return 0.0
-    return round(max(0.4, len(audio_bytes) / 5800.0), 2)
+def trim_silence_and_measure_mp3(raw_mp3: bytes) -> Tuple[bytes, float]:
+    """
+    Uses FFmpeg to strip Edge-TTS leading/trailing silence (200-350ms dead air)
+    and outputs CBR 64kbps MP3 where byte length / 8000.0 gives exact duration to +-0.02s.
+    """
+    if not raw_mp3 or len(raw_mp3) < 200:
+        return raw_mp3, 0.0
+
+    try:
+        cmd = [
+            FFMPEG_EXE,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", "pipe:0",
+            "-af", (
+                "silenceremove=start_periods=1:start_silence=0.03:start_threshold=-42dB,"
+                "areverse,"
+                "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-42dB,"
+                "areverse"
+            ),
+            "-ac", "1",
+            "-ar", "24000",
+            "-c:a", "libmp3lame",
+            "-b:a", "64k",
+            "-write_xing", "0",
+            "-f", "mp3",
+            "pipe:1"
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        stdout, _ = proc.communicate(input=raw_mp3, timeout=4.0)
+        if proc.returncode == 0 and len(stdout) > 400:
+            # CBR 64kbps = exactly 8000 bytes per second
+            exact_dur = round(max(0.25, len(stdout) / 8000.0), 2)
+            return stdout, exact_dur
+    except Exception:
+        pass
+
+    fallback_dur = round(max(0.35, len(raw_mp3) / 6000.0), 2)
+    return raw_mp3, fallback_dur
 
 
 def split_text_chunks(text: str, max_chars: int = 180) -> List[str]:
@@ -78,10 +131,10 @@ def split_text_chunks(text: str, max_chars: int = 180) -> List[str]:
 class EdgeTTS:
     def __init__(self, default_voice: str = "vi-VN-HoaiMyNeural"):
         self.default_voice = default_voice
-        self._sem = asyncio.Semaphore(4)
+        self._sem = asyncio.Semaphore(5)
 
     def _get_cache_key(self, text: str, voice: str, rate: int, pitch: int) -> str:
-        raw = f"{text}|{voice}|{rate}|{pitch}".encode("utf-8")
+        raw = f"v2|{text}|{voice}|{rate}|{pitch}".encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
     async def _run_edge_once(self, clean_text: str, voice_name: str, rate: int, pitch: int, use_custom: bool) -> bytes:
@@ -121,14 +174,14 @@ class EdgeTTS:
                             audio_parts.append(data)
         return b"".join(audio_parts)
 
-    def _save_to_cache(self, cache_key: str, cache_file: Path, audio_bytes: bytes) -> Tuple[bytes, float, str]:
-        duration = estimate_mp3_duration(audio_bytes)
-        cache_file.write_bytes(audio_bytes)
+    async def _save_to_cache(self, cache_key: str, cache_file: Path, raw_audio_bytes: bytes) -> Tuple[bytes, float, str]:
+        trimmed_bytes, duration = await asyncio.to_thread(trim_silence_and_measure_mp3, raw_audio_bytes)
+        cache_file.write_bytes(trimmed_bytes)
         if len(MEMORY_CACHE) >= MAX_MEMORY_CACHE:
             for k in list(MEMORY_CACHE.keys())[:50]:
                 MEMORY_CACHE.pop(k, None)
-        MEMORY_CACHE[cache_key] = (audio_bytes, duration)
-        return audio_bytes, duration, cache_key
+        MEMORY_CACHE[cache_key] = (trimmed_bytes, duration)
+        return trimmed_bytes, duration, cache_key
 
     async def synthesize(
         self,
@@ -138,8 +191,8 @@ class EdgeTTS:
         pitch: int = 0
     ) -> Tuple[bytes, float, str]:
         """
-        Synthesizes text to MP3 audio bytes using Microsoft Edge Neural Voice (HoaiMy / NamMinh),
-        falling back to Google TTS only if Edge TTS errors out on that specific sentence.
+        Synthesizes text to silence-trimmed CBR 64k MP3 audio bytes using Microsoft Edge Neural Voice,
+        returning (audio_bytes, exact_duration_sec, cache_key).
         """
         clean_text = clean_text_for_speech(text)
         if not clean_text or len(clean_text) < 2:
@@ -158,11 +211,11 @@ class EdgeTTS:
         if cache_file.exists():
             data = cache_file.read_bytes()
             if len(data) > 200:
-                dur = estimate_mp3_duration(data)
+                dur = round(max(0.25, len(data) / 8000.0), 2)
                 MEMORY_CACHE[cache_key] = (data, dur)
                 return data, dur, cache_key
 
-        # 3. Call Edge Neural TTS inside semaphore (3.5s timeout starts only AFTER semaphore is acquired!)
+        # 3. Call Edge Neural TTS inside semaphore
         async with self._sem:
             try:
                 audio_bytes = await asyncio.wait_for(
@@ -170,7 +223,7 @@ class EdgeTTS:
                     timeout=3.5
                 )
                 if audio_bytes and len(audio_bytes) > 200:
-                    return self._save_to_cache(cache_key, cache_file, audio_bytes)
+                    return await self._save_to_cache(cache_key, cache_file, audio_bytes)
             except Exception:
                 pass
 
@@ -178,7 +231,7 @@ class EdgeTTS:
             try:
                 g_bytes = await self._synthesize_google_tts(clean_text)
                 if g_bytes and len(g_bytes) > 200:
-                    return self._save_to_cache(cache_key, cache_file, g_bytes)
+                    return await self._save_to_cache(cache_key, cache_file, g_bytes)
             except Exception as e:
                 raise RuntimeError(f"Both Edge TTS and Google TTS fallback failed: {e}")
 

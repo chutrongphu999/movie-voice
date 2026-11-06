@@ -34,8 +34,11 @@ function base64ToUint8Array(b64) {
   return out;
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return false;
+
+  const tabTitle = (sender && sender.tab && sender.tab.title) ? sender.tab.title : "";
+  const movieTitle = msg.movieTitle || tabTitle || "";
 
   if (msg.type === "DUB_AUDIO_B64") {
     (async () => {
@@ -47,6 +50,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         form.append("voice", msg.voice || "vi-VN-HoaiMyNeural");
         form.append("rate", String(msg.rate || 0));
         form.append("pitch", String(msg.pitch || 0));
+        form.append("movie_title", movieTitle);
 
         const resp = await fetch(`${DEFAULT_ENGINE}/api/dub/audio`, {
           method: "POST",
@@ -69,10 +73,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "DUB_SUBTITLES") {
     (async () => {
       try {
+        const payload = { ...(msg.payload || {}), movie_title: movieTitle };
         const resp = await fetch(`${DEFAULT_ENGINE}/api/dub/subtitles`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(msg.payload)
+          body: JSON.stringify(payload)
         });
         if (!resp.ok) {
           sendResponse({ ok: false, error: `HTTP ${resp.status}` });

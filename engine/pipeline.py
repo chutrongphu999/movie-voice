@@ -1,4 +1,6 @@
-"""Movie Voice Dubbing Pipeline: Orchestrates ASR -> Context-Aware Batch Translation -> Non-Blocking Neural TTS."""
+"""Movie Voice Dubbing Pipeline: Orchestrates ASR -> Story-Bible Slot-Fitted Translation -> Silence-Trimmed Neural TTS.
+Directly incorporates the architecture from _refs/real-time-video-subs (rtsubs) and _refs/LocalDub.
+"""
 import os
 import time
 import asyncio
@@ -6,7 +8,27 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from providers.asr_groq import GroqASR
 from providers.translate_gemini import Translator
-from providers.tts_edge import EdgeTTS, CACHE_DIR, clean_text_for_speech
+from providers.tts_edge import EdgeTTS, CACHE_DIR, MEMORY_CACHE, clean_text_for_speech
+
+
+def compute_non_overlapping_slots(cues: List[Dict[str, Any]]) -> List[float]:
+    """
+    Computes the exact available speaking window (slot in seconds) for each cue
+    so a sentence never overflows into the next sentence (from rtsubs/pipeline.py).
+    """
+    slots: List[float] = []
+    n = len(cues)
+    for i, c in enumerate(cues):
+        start = float(c.get("start", 0.0))
+        end = float(c.get("end", start + 2.0))
+        if i + 1 < n:
+            next_start = float(cues[i + 1].get("start", end + 0.5))
+            effective_end = min(end + 0.35, next_start - 0.04)
+        else:
+            effective_end = end + 0.45
+        c["slot_end"] = round(max(start + 0.65, effective_end), 2)
+        slots.append(round(max(0.8, c["slot_end"] - start), 2))
+    return slots
 
 
 class DubbingPipeline:
@@ -27,7 +49,7 @@ class DubbingPipeline:
             groq_key=os.getenv("GROQ_API_KEY", "")
         )
 
-    def is_duplicate(self, text: str, start: float, threshold_sec: float = 3.5) -> bool:
+    def is_duplicate(self, text: str, start: float, threshold_sec: float = 3.2) -> bool:
         """Avoids re-speaking duplicate lines within a time window."""
         norm = text.lower().strip()
         if not norm:
@@ -39,12 +61,14 @@ class DubbingPipeline:
                 return True
         return False
 
-    def _get_recent_context(self) -> str:
-        """Returns up to 6 most recent translated dialogue lines for pronoun & plot consistency."""
-        recent = self.spoken_cues[-6:]
-        if not recent:
-            return ""
-        return "\n".join(f"- {c.get('original', '')} => {c.get('text', '')}" for c in recent)
+    def _get_recent_pairs(self) -> List[Dict[str, str]]:
+        """Returns up to 8 most recent (src, vi) dialogue pairs for Story Bible context continuity."""
+        recent = self.spoken_cues[-8:]
+        return [
+            {"src": str(c.get("original", "")), "vi": str(c.get("text", ""))}
+            for c in recent
+            if c.get("original") and c.get("text")
+        ]
 
     async def get_or_wait_audio(self, audio_id: str) -> Optional[Path]:
         """
@@ -74,12 +98,12 @@ class DubbingPipeline:
     ) -> List[Dict[str, Any]]:
         """
         Starts TTS synthesis for all cues in parallel background tasks, awaits ONLY the first cue
-        so the response returns ~3s faster while remaining cues finish in the background!
+        so the response returns immediately while remaining cues finish in the background.
         """
         out_cues = []
         first_task = None
 
-        for idx, (cue, vi_text) in enumerate(cues_and_texts):
+        for cue, vi_text in cues_and_texts:
             clean_vi = clean_text_for_speech(vi_text)
             if not clean_vi or len(clean_vi) < 2:
                 continue
@@ -87,10 +111,14 @@ class DubbingPipeline:
             voice_name = voice or self.tts.default_voice
             audio_id = self.tts._get_cache_key(clean_vi, voice_name, rate, pitch)
 
-            # Estimate speech duration (~14 chars/sec in Vietnamese) until actual MP3 is fetched
-            est_dur = round(max(1.2, len(clean_vi) / 14.0), 2)
+            # Initial estimate (~16.5 chars/sec after silence trim) until exact CBR 64k MP3 is measured
+            est_dur = round(max(0.7, len(clean_vi) / 16.5), 2)
+            if audio_id in MEMORY_CACHE:
+                est_dur = MEMORY_CACHE[audio_id][1]
+
             start = float(cue.get("start", 0.0))
             end = float(cue.get("end", start + est_dur))
+            slot_end = float(cue.get("slot_end", end + 0.35))
 
             if audio_id not in self.tts_tasks and not (CACHE_DIR / f"{audio_id}.mp3").exists():
                 task = asyncio.create_task(
@@ -105,6 +133,7 @@ class DubbingPipeline:
                 "id": audio_id,
                 "start": round(start, 2),
                 "end": round(end, 2),
+                "slot_end": round(slot_end, 2),
                 "original": cue.get("text", ""),
                 "text": clean_vi,
                 "duration": est_dur,
@@ -131,30 +160,47 @@ class DubbingPipeline:
         time_offset: float,
         voice: str = "vi-VN-HoaiMyNeural",
         rate: int = 0,
-        pitch: int = 0
+        pitch: int = 0,
+        movie_title: str = ""
     ) -> List[Dict[str, Any]]:
         """
-        Receives an audio chunk captured by MSE hook,
-        runs ASR to extract dialogue with timestamps, translates to Vietnamese with context,
-        and schedules parallel TTS.
+        Receives an audio chunk captured by MSE/HLS hook,
+        runs ASR with Story Bible glossary hint, translates with slot-based max_chars budget,
+        and schedules parallel silence-trimmed TTS.
         """
         if not audio_bytes or len(audio_bytes) < 1000:
             return []
 
+        if movie_title:
+            self.translator.set_movie_title(movie_title)
+
         t0 = time.monotonic()
-        raw_cues = await self.asr.transcribe(audio_bytes, time_offset=time_offset)
+        glossary_hint = self.translator.get_whisper_glossary_hint()
+        raw_cues = await self.asr.transcribe(
+            audio_bytes,
+            time_offset=time_offset,
+            glossary_hint=glossary_hint
+        )
         if not raw_cues:
             return []
         t_asr = time.monotonic() - t0
 
-        new_cues = [c for c in raw_cues if not self.is_duplicate(c["text"], c["start"])][:8]
+        new_cues = [c for c in raw_cues if not self.is_duplicate(c["text"], c["start"])][:10]
         if not new_cues:
             return []
 
+        # Feed transcribed cues into Story Bible builder (runs asynchronously in background)
+        self.translator.record_source_cues(new_cues)
+
+        slots = compute_non_overlapping_slots(new_cues)
+
         t1 = time.monotonic()
         texts = [c["text"] for c in new_cues]
-        context_hint = self._get_recent_context()
-        translated_texts = await self.translator.translate_batch(texts, context_hint=context_hint)
+        translated_texts = await self.translator.translate_batch(
+            texts,
+            slots=slots,
+            previous_pairs=self._get_recent_pairs()
+        )
         t_tr = time.monotonic() - t1
 
         t2 = time.monotonic()
@@ -183,7 +229,8 @@ class DubbingPipeline:
         voice: str = "vi-VN-HoaiMyNeural",
         rate: int = 0,
         pitch: int = 0,
-        is_vietnamese: bool = True
+        is_vietnamese: bool = True,
+        movie_title: str = ""
     ) -> List[Dict[str, Any]]:
         """
         Processes soft subtitles detected in player (DOM or VTT/SRT).
@@ -192,16 +239,25 @@ class DubbingPipeline:
         if not cues:
             return []
 
+        if movie_title:
+            self.translator.set_movie_title(movie_title)
+
         new_cues = [c for c in cues if not self.is_duplicate(c.get("text", ""), float(c.get("start", 0)))][:12]
         if not new_cues:
             return []
 
+        slots = compute_non_overlapping_slots(new_cues)
         texts = [c.get("text", "").strip() for c in new_cues]
 
         if is_vietnamese:
             translated_texts = texts
         else:
-            translated_texts = await self.translator.translate_batch(texts, context_hint=self._get_recent_context())
+            self.translator.record_source_cues(new_cues)
+            translated_texts = await self.translator.translate_batch(
+                texts,
+                slots=slots,
+                previous_pairs=self._get_recent_pairs()
+            )
 
         return await self._schedule_tts_batch(
             list(zip(new_cues, translated_texts)),

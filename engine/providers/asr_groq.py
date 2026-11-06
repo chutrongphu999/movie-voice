@@ -122,10 +122,12 @@ def merge_short_segments(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         combined_dur = cur["end"] - prev["start"]
         prev_ends_sentence = bool(re.search(r"[.!?…]$", prev["text"].strip()))
 
-        if gap < 0.45 and combined_dur <= 6.5 and (not prev_ends_sentence or (prev["end"] - prev["start"]) < 1.8):
+        if gap < 0.45 and combined_dur <= 6.8 and (not prev_ends_sentence or (prev["end"] - prev["start"]) < 1.8):
             prev["end"] = round(cur["end"], 3)
             prev["text"] = f"{prev['text'].rstrip()} {cur['text'].lstrip()}".strip()
         else:
+            if cur["start"] < prev["end"]:
+                prev["end"] = round(max(prev["start"] + 0.4, cur["start"] - 0.04), 3)
             merged.append(cur.copy())
 
     return merged
@@ -177,7 +179,7 @@ class GroqASR:
 
         return await asyncio.to_thread(_run_ffmpeg)
 
-    async def transcribe(self, audio_bytes: bytes, time_offset: float = 0.0) -> List[Dict[str, Any]]:
+    async def transcribe(self, audio_bytes: bytes, time_offset: float = 0.0, glossary_hint: str = "") -> List[Dict[str, Any]]:
         """
         Transcribes audio bytes and returns clean, merged segments with clamped timestamps.
         """
@@ -206,7 +208,12 @@ class GroqASR:
         self._last_offset = time_offset
 
         language = os.getenv("ASR_LANGUAGE", "auto").strip().lower()
-        prompt_hint = self._last_prompt[-180:] if self._last_prompt else None
+        prompt_parts = []
+        if glossary_hint:
+            prompt_parts.append(glossary_hint[:110])
+        if self._last_prompt:
+            prompt_parts.append(self._last_prompt[-120:])
+        prompt_hint = " | ".join(prompt_parts) if prompt_parts else None
 
         result = None
         for attempt in range(3):

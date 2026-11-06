@@ -331,15 +331,17 @@
           initChunk: null,
           lastInitHasAudio: true,
           fragments: [],
+          fragMeta: [],
           totalBytes: 0,
           batchStart: null,
           batchEnd: null,
           hasFlushedFirst: false
         };
 
-        function flushTracker() {
+        function flushTracker(keepOverlap = true) {
           if (tracker.fragments.length === 0 || tracker.batchStart === null || !tracker.initChunk) {
             tracker.fragments = [];
+            tracker.fragMeta = [];
             tracker.totalBytes = 0;
             tracker.batchStart = null;
             tracker.batchEnd = null;
@@ -347,6 +349,7 @@
           }
           if (hasDedicatedAudioBuffer && !tracker.isDedicatedAudio) {
             tracker.fragments = [];
+            tracker.fragMeta = [];
             tracker.totalBytes = 0;
             return;
           }
@@ -363,10 +366,31 @@
           const startTime = tracker.batchStart;
           const endTime = tracker.batchEnd ?? (startTime + 6.0);
 
-          tracker.fragments = [];
-          tracker.totalBytes = 0;
-          tracker.batchStart = null;
-          tracker.batchEnd = null;
+          // Keep last fragment (if <= 4.5s) as sliding overlap so sentences at chunk boundaries are never cut in half
+          const lastIdx = tracker.fragments.length - 1;
+          const lastMeta = tracker.fragMeta[lastIdx];
+          const lastFrag = tracker.fragments[lastIdx];
+          const canOverlap =
+            keepOverlap &&
+            tracker.fragments.length >= 2 &&
+            lastMeta &&
+            (lastMeta.end - lastMeta.start) >= 1.2 &&
+            (lastMeta.end - lastMeta.start) <= 4.5 &&
+            lastFrag.byteLength < 800000;
+
+          if (canOverlap) {
+            tracker.fragments = [lastFrag];
+            tracker.fragMeta = [lastMeta];
+            tracker.totalBytes = lastFrag.byteLength;
+            tracker.batchStart = lastMeta.start;
+            tracker.batchEnd = lastMeta.end;
+          } else {
+            tracker.fragments = [];
+            tracker.fragMeta = [];
+            tracker.totalBytes = 0;
+            tracker.batchStart = null;
+            tracker.batchEnd = null;
+          }
           tracker.hasFlushedFirst = true;
 
           emitBatch({
@@ -428,11 +452,12 @@
                         const added = findAddedRange(prevRanges, nextRanges);
 
                         if (added && tracker.batchEnd !== null && Math.abs(added.start - tracker.batchEnd) > 2.5) {
-                          flushTracker();
+                          flushTracker(false);
                           tracker.hasFlushedFirst = false;
                         }
 
                         tracker.fragments.push(mediaChunk);
+                        tracker.fragMeta.push(added || null);
                         tracker.totalBytes += mediaChunk.byteLength;
 
                         if (added) {
@@ -443,14 +468,14 @@
 
                           const batchDur = tracker.batchEnd - tracker.batchStart;
 
-                          // First batch after start/seek flushes immediately (~3.2s+); subsequent batches group ~7.2s
+                          // First batch after start/seek flushes at ~4.8s; subsequent batches group ~10.0s with 1-fragment overlap
                           const shouldFlush =
-                            (!tracker.hasFlushedFirst && batchDur >= 3.2) ||
-                            (batchDur >= 7.2) ||
-                            (tracker.totalBytes >= 3500000);
+                            (!tracker.hasFlushedFirst && batchDur >= 4.8) ||
+                            (batchDur >= 10.0) ||
+                            (tracker.totalBytes >= 4000000);
 
                           if (shouldFlush) {
-                            flushTracker();
+                            flushTracker(true);
                           }
                         }
                       } catch (e) {}
