@@ -93,6 +93,10 @@ async def dub_audio_chunk(
         )
         return {"cues": cues}
     except Exception as e:
+        import traceback
+        print(f"[Error in /api/dub/audio]: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 

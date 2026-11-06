@@ -58,7 +58,12 @@ class GroqASR:
             raise RuntimeError("Chưa cấu hình GROQ_API_KEY trong engine/.env!")
 
         # Convert input buffer to clean WAV
-        wav_bytes = await self.convert_to_wav(audio_bytes)
+        try:
+            wav_bytes = await self.convert_to_wav(audio_bytes)
+        except Exception as e:
+            print(f"[ASR Warning] Chunk cannot be decoded by FFmpeg yet (likely missing init segment or keyframe): {e}")
+            return []
+
         if len(wav_bytes) < 1000:
             return []
 

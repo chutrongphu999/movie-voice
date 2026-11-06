@@ -43,9 +43,11 @@
   }
 
   let activeVideo = null;
+  let savedInitChunk = null;
   let audioChunksBuffer = [];
   let bufferTotalBytes = 0;
   let isUploadingChunk = false;
+  let lastUploadTime = 0;
   let cueQueue = [];
   let currentPlayingSource = null;
   let isDucked = false;
@@ -106,7 +108,7 @@
 
     try {
       const ctx = getAudioContext();
-      setStatus(`🎙️ Lồng tiếng: ${cue.text}`);
+      setStatus(`🎙️ ${cue.text}`);
 
       const audioUrl = `${ENGINE_URL}${cue.audio_url}`;
       const resp = await fetch(audioUrl);
@@ -142,39 +144,56 @@
     const currTime = activeVideo.currentTime;
     for (let i = 0; i < cueQueue.length; i++) {
       const cue = cueQueue[i];
-      // If cue start time is within 0.4s of current video time, trigger playback
-      if (Math.abs(currTime - cue.start) < 0.5 || (currTime >= cue.start && currTime <= cue.end)) {
+      // If cue start time is within 0.5s of current video time, trigger playback
+      if (Math.abs(currTime - cue.start) < 0.6 || (currTime >= cue.start && currTime <= cue.end)) {
         cueQueue.splice(i, 1);
         playDubCue(cue);
         break;
       }
       // Drop cues that have expired
-      if (currTime > cue.end + 2.0) {
+      if (currTime > cue.end + 2.5) {
         cueQueue.splice(i, 1);
         i--;
       }
     }
-  }, 150);
+  }, 120);
 
   // Send accumulated MSE audio chunks to Engine
   async function flushMseBuffer() {
     if (!config.enabled || isUploadingChunk || audioChunksBuffer.length === 0 || !activeVideo) return;
-    if (bufferTotalBytes < 120000) return; // Wait for at least ~120KB of audio data
+    if (activeVideo.paused) return;
+    if (bufferTotalBytes < 100000) return; // Wait for at least ~100KB of audio data
+
+    // Minimum 4 seconds between requests to avoid hitting rate limits
+    const now = Date.now();
+    if (now - lastUploadTime < 4000) return;
 
     isUploadingChunk = true;
+    lastUploadTime = now;
+
     const chunksToSend = audioChunksBuffer.slice(0);
     audioChunksBuffer = [];
     bufferTotalBytes = 0;
 
-    const totalLen = chunksToSend.reduce((acc, c) => acc + c.byteLength, 0);
+    // Check if the stream starts with init box (ftyp). If not and we have savedInitChunk, prepend it!
+    let parts = chunksToSend.slice(0);
+    if (savedInitChunk && parts.length > 0) {
+      const first = new Uint8Array(parts[0]);
+      const hasFtyp = first.length > 8 && first[4] === 0x66 && first[5] === 0x74 && first[6] === 0x79 && first[7] === 0x70;
+      if (!hasFtyp) {
+        parts.unshift(savedInitChunk);
+      }
+    }
+
+    const totalLen = parts.reduce((acc, c) => acc + c.byteLength, 0);
     const merged = new Uint8Array(totalLen);
     let offset = 0;
-    for (const c of chunksToSend) {
+    for (const c of parts) {
       merged.set(new Uint8Array(c), offset);
       offset += c.byteLength;
     }
 
-    const timeOffset = Math.max(0, activeVideo.currentTime - 2.0);
+    const timeOffset = Math.max(0, activeVideo.currentTime - 1.0);
     const formData = new FormData();
     formData.append("file", new Blob([merged], { type: "audio/mp4" }), "stream.mp4");
     formData.append("time_offset", String(timeOffset));
@@ -182,7 +201,7 @@
     formData.append("rate", String(config.rate));
     formData.append("pitch", String(config.pitch));
 
-    setStatus("⚡ Đang nhận diện & lồng tiếng...");
+    setStatus("⚡ Đang nhận diện...");
 
     try {
       const resp = await fetch(`${ENGINE_URL}/api/dub/audio`, {
@@ -195,13 +214,13 @@
           for (const cue of data.cues) {
             cueQueue.push(cue);
           }
-          setStatus(`Đã nạp ${data.cues.length} câu lồng tiếng`);
+          setStatus(`Đã nạp ${data.cues.length} câu`);
         } else {
           setStatus("Đang phát phim");
         }
       }
     } catch (err) {
-      // Server not reachable or network issue
+      // Ignore network blip
     } finally {
       isUploadingChunk = false;
     }
@@ -210,11 +229,17 @@
   // Receive MSE chunks from MAIN world mse-hook.js
   window.addEventListener("message", (event) => {
     if (event.data && event.data.type === "__MOVIE_VOICE_MSE_CHUNK__" && event.data.buffer) {
+      if (!event.data.isAudio) return;
+
+      if (event.data.isInit) {
+        savedInitChunk = event.data.buffer.slice(0);
+      }
+
       audioChunksBuffer.push(event.data.buffer);
       bufferTotalBytes += event.data.byteLength;
 
-      // Periodically trigger flush when enough data arrives
-      if (bufferTotalBytes > 250000) {
+      // When ~250KB of audio data has buffered, trigger flush
+      if (bufferTotalBytes >= 250000) {
         flushMseBuffer();
       }
     }
@@ -245,7 +270,7 @@
     uiContainer.className = "movie-voice-floating-bar";
     uiContainer.innerHTML = `
       <button class="mv-toggle-btn ${config.enabled ? 'active' : ''}">🎙️ LỒNG TIẾNG: BẬT</button>
-      <span class="mv-status-text">Đang kết nối...</span>
+      <span class="mv-status-text">Sẵn sàng</span>
     `;
 
     uiContainer.querySelector(".mv-toggle-btn").addEventListener("click", () => {
@@ -303,6 +328,6 @@
     }
   );
 
-  // Periodically flush buffer every 3s if new chunks exist
-  setInterval(flushMseBuffer, 3000);
+  // Periodically flush buffer every 5s if new chunks exist
+  setInterval(flushMseBuffer, 5000);
 })();
