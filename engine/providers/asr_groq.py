@@ -74,10 +74,17 @@ def is_hallucination_text(text: str, duration: float) -> bool:
     return False
 
 
+ASR_MODELS = [
+    "whisper-large-v3-turbo",
+    "whisper-large-v3",
+]
+
+
 class GroqASR:
     def __init__(self, api_key: str = None, model: str = "whisper-large-v3-turbo"):
         self.api_key = api_key or os.getenv("GROQ_API_KEY", "")
         self.model = model
+        self._model_idx = 0
         self.client = groq.Groq(api_key=self.api_key) if self.api_key else None
 
     def update_key(self, api_key: str):
@@ -138,15 +145,30 @@ class GroqASR:
         if rms < 55.0:
             return []
 
-        def _call_groq():
-            return self.client.audio.transcriptions.create(
-                file=("chunk.wav", wav_bytes),
-                model=self.model,
-                response_format="verbose_json",
-                temperature=0.0
-            )
+        # Alternate between whisper-large-v3-turbo and whisper-large-v3 (each has its own 20 RPM bucket = 40 RPM total)
+        result = None
+        for attempt in range(3):
+            chosen_model = ASR_MODELS[(self._model_idx + attempt) % len(ASR_MODELS)]
+            try:
+                def _call_groq(m=chosen_model):
+                    return self.client.audio.transcriptions.create(
+                        file=("chunk.wav", wav_bytes),
+                        model=m,
+                        response_format="verbose_json",
+                        temperature=0.0
+                    )
+                result = await asyncio.to_thread(_call_groq)
+                self._model_idx = (self._model_idx + 1) % len(ASR_MODELS)
+                break
+            except groq.RateLimitError:
+                print(f"[ASR] Rate limit on {chosen_model}, switching model / waiting...")
+                await asyncio.sleep(1.2 * (attempt + 1))
+            except Exception as e:
+                print(f"[ASR Warning] Groq transcription error on {chosen_model}: {e}")
+                return []
 
-        result = await asyncio.to_thread(_call_groq)
+        if result is None:
+            return []
         cues = []
         segments = getattr(result, "segments", []) or []
 

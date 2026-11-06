@@ -1,5 +1,5 @@
-// Movie Voice - In-Page Web Audio Dubbing Player v4.2
-// Receives MSE audio batches & soft subtitles, prefetches TTS audio, and schedules non-overlapping dubbing with Smart Ducking
+// Movie Voice - In-Page Web Audio Dubbing Player v4.4
+// Uses a Playhead-Synchronized Lookahead Queue so MSE batches are always processed in chronological order right ahead of video.currentTime!
 (function () {
   "use strict";
 
@@ -25,7 +25,7 @@
       for (const [key, val] of Object.entries(changes)) {
         config[key] = val.newValue;
       }
-      if (!config.enabled) stopAllSpeech();
+      if (!config.enabled) stopAllSpeech(true);
       updateUI();
     });
   }
@@ -151,8 +151,7 @@
     }, 450);
   }
 
-  function stopAllSpeech() {
-    cueQueue = [];
+  function stopCurrentSpeechOnly() {
     isSpeaking = false;
     if (currentSourceNode) {
       try { currentSourceNode.stop(); } catch (e) {}
@@ -163,6 +162,13 @@
       fallbackAudioEl.removeAttribute("src");
     } catch (e) {}
     restoreDucking(true);
+  }
+
+  function stopAllSpeech(clearQueues = false) {
+    if (clearQueues) {
+      cueQueue = [];
+    }
+    stopCurrentSpeechOnly();
   }
 
   // Fetch voice audio bytes via background worker (or direct fetch fallback)
@@ -200,7 +206,6 @@
         seenCueKeys.delete(firstKey);
       }
 
-      // Prefetch audio immediately so it's ready in memory before cue.start
       cue.audioPromise = fetchVoicePayload(cue.audio_url).catch((err) => {
         sendClientLog("PREFETCH_ERR", String(err));
         return null;
@@ -208,7 +213,6 @@
       cueQueue.push(cue);
       added++;
     }
-    // Keep queue sorted by start time
     cueQueue.sort((a, b) => a.start - b.start);
     if (added > 0 && !isSpeaking) {
       setStatus(`Sẵn sàng (${cueQueue.length} câu chờ đọc)`);
@@ -262,14 +266,13 @@
       }
 
       if (!playedViaWebAudio) {
-        // Fallback to HTML5 Audio element using data: URL (bypasses blob: CSP restrictions)
         const dataUrl = `data:audio/mpeg;base64,${payload.b64}`;
         sendClientLog("PLAY_FALLBACK (HTML5Audio)", `${cue.start.toFixed(1)}s (ctx=${ctx ? ctx.state : 'none'}) | "${cue.text}"`);
         await new Promise((resolve, reject) => {
           fallbackAudioEl.src = dataUrl;
           fallbackAudioEl.playbackRate = playbackRate;
           fallbackAudioEl.onended = () => resolve();
-          fallbackAudioEl.onerror = (e) => reject(new Error("HTML5 Audio error"));
+          fallbackAudioEl.onerror = () => reject(new Error("HTML5 Audio error"));
           fallbackAudioEl.play().catch(reject);
         });
       }
@@ -278,8 +281,6 @@
       sendClientLog("PLAY_FAILED", `${cue.start.toFixed(1)}s | ${errMsg}`);
       if (err && err.name === "NotAllowedError") {
         setStatus("🔊 Bấm 1 lần vào video để mở khóa tiếng!");
-      } else {
-        console.warn("[Movie Voice] Playback error:", err);
       }
     } finally {
       isSpeaking = false;
@@ -295,8 +296,8 @@
 
     const currTime = activeVideo.currentTime;
 
-    // 1. Drop cues that are too old (ended more than 16s ago) or way in the past after a seek
-    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 16.0) {
+    // 1. Drop cues that are too old (ended more than 12s before current playhead)
+    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 12.0) {
       const dropped = cueQueue.shift();
       sendClientLog("CUE_EXPIRED", `Cue ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s dropped at video=${currTime.toFixed(1)}s`);
     }
@@ -304,10 +305,9 @@
 
     const nextCue = cueQueue[0];
 
-    // 2. If the next cue is due now (or arrived slightly late within the 16s grace window), play it!
-    if (currTime >= nextCue.start - 0.35) {
+    // 2. If the next cue is due now (and not >12s in the future after a backward seek), play it!
+    if (currTime >= nextCue.start - 0.35 && currTime <= nextCue.end + 12.0) {
       cueQueue.shift();
-      // Speed up slightly if we are catching up or if more cues are waiting right behind
       let speed = 1.0 + (config.rate || 0) / 100;
       const lag = currTime - nextCue.start;
       if (lag > 1.5 || cueQueue.length >= 2) {
@@ -317,18 +317,40 @@
     }
   }, 100);
 
-  // Send MSE batch to Engine via background worker (or direct fetch fallback)
+  // Playhead-synchronized MSE Batch Scheduler:
+  // Always picks the earliest batch right at/ahead of activeVideo.currentTime (within +32s lookahead)
   async function processNextMseBatch() {
     if (!config.enabled || inFlightUploads >= 2 || pendingMseBatches.length === 0) return;
 
-    const batch = pendingMseBatches.shift();
-    // If activeVideo has already moved far past this batch, skip it
-    if (activeVideo && activeVideo.currentTime > batch.endTime + 10.0 && batch.endTime > 0) {
+    const currTime = activeVideo ? activeVideo.currentTime : 0;
+
+    // 1. Prune batches that are far behind current playhead (> 60s old)
+    pendingMseBatches = pendingMseBatches.filter((b) => b.endTime >= currTime - 60.0);
+
+    // 2. Sort ascending by startTime so we ALWAYS process earliest segments first!
+    pendingMseBatches.sort((a, b) => a.startTime - b.startTime);
+
+    // 3. Find the earliest batch that covers current playhead or is within the next 32 seconds
+    let targetIdx = -1;
+    for (let i = 0; i < pendingMseBatches.length; i++) {
+      const b = pendingMseBatches[i];
+      if (b.endTime >= currTime - 0.5) {
+        if (currTime === 0 || b.startTime <= currTime + 32.0) {
+          targetIdx = i;
+        }
+        break;
+      }
+    }
+
+    if (targetIdx === -1) {
+      // All relevant batches within the next 32s are already processed; wait for playhead to advance
       return;
     }
 
+    const [batch] = pendingMseBatches.splice(targetIdx, 1);
+
     inFlightUploads++;
-    if (!isSpeaking) {
+    if (!isSpeaking && cueQueue.length === 0) {
       setStatus(`⚡ Đang dịch đoạn ${Math.floor(batch.startTime)}s...`);
     }
 
@@ -388,6 +410,13 @@
     }
   }
 
+  // Periodically check if video playhead has advanced into the 32s lookahead window of buffered MSE batches
+  setInterval(() => {
+    if (config.enabled && pendingMseBatches.length > 0 && inFlightUploads < 2) {
+      processNextMseBatch();
+    }
+  }, 600);
+
   // Listen for MSE audio batches from mse-hook.js
   window.addEventListener("message", (event) => {
     if (!event.data || event.data.type !== "__MOVIE_VOICE_MSE_BATCH__" || !event.data.buffer) {
@@ -407,9 +436,10 @@
       buffer: event.data.buffer
     });
 
-    // Keep queue bounded
-    if (pendingMseBatches.length > 8) {
-      pendingMseBatches.shift();
+    // Sort by startTime ascending and cap at 45 batches (removing from the far future, NEVER removing near batches!)
+    pendingMseBatches.sort((a, b) => a.startTime - b.startTime);
+    if (pendingMseBatches.length > 45) {
+      pendingMseBatches.pop();
     }
 
     processNextMseBatch();
@@ -452,7 +482,7 @@
       getAudioContext();
       config.enabled = !config.enabled;
       if (!config.enabled) {
-        stopAllSpeech();
+        stopAllSpeech(true);
       }
       if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.sync) {
         chrome.storage.sync.set({ enabled: config.enabled });
@@ -476,19 +506,26 @@
 
     video.addEventListener("play", () => {
       getAudioContext();
+      processNextMseBatch();
     });
 
     video.addEventListener("pause", () => {
-      if (video === activeVideo && currentSourceNode) {
-        try { currentSourceNode.stop(); } catch (e) {}
+      if (video === activeVideo) {
+        stopCurrentSpeechOnly();
       }
-      restoreDucking(true);
     });
 
     video.addEventListener("seeking", () => {
       if (video === activeVideo) {
-        stopAllSpeech();
+        stopCurrentSpeechOnly();
         setStatus("Đang đồng bộ vị trí mới...");
+      }
+    });
+
+    video.addEventListener("seeked", () => {
+      if (video === activeVideo) {
+        sendClientLog("VIDEO_SEEKED", `currentTime=${video.currentTime.toFixed(1)}s, queuedBatches=${pendingMseBatches.length}`);
+        processNextMseBatch();
       }
     });
   }
@@ -500,8 +537,8 @@
       bindVideoEvents(video);
       mountUI(video);
       sendClientLog("VIDEO_DETECTED", `duration=${(video.duration || 0).toFixed(1)}s, currentTime=${(video.currentTime || 0).toFixed(1)}s`);
-      // Re-signal ready in case video was dynamically created
       window.postMessage({ type: "__MOVIE_VOICE_PLAYER_READY__" }, "*");
+      processNextMseBatch();
     },
     async (sub) => {
       // Soft subtitle detected

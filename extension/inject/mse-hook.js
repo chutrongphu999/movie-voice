@@ -1,4 +1,4 @@
-// Movie Voice - Media Source Extensions (MSE) Hook
+// Movie Voice - Media Source Extensions (MSE) Hook v4.4
 // Runs in MAIN world at document_start to intercept audio streams with exact buffered timestamps
 (function () {
   "use strict";
@@ -42,48 +42,60 @@
   }
 
   // Diff before/after buffered ranges to find the newly appended segment's [start, end]
+  // Properly handles back-buffer eviction by matching overlapping ranges!
   function findAddedRange(prev, next) {
     if (!next || next.length === 0) return null;
     if (!prev || prev.length === 0) {
-      return { start: next[0][0], end: next[next.length - 1][1] };
+      const first = next[next.length - 1];
+      return { start: Math.max(first[0], first[1] - 5.0), end: first[1] };
     }
+
+    // 1. Check overlapping ranges between prev and next (immune to back-buffer eviction at ns)
     for (let i = 0; i < next.length; i++) {
       const [ns, ne] = next[i];
-      let matched = false;
       for (let j = 0; j < prev.length; j++) {
         const [ps, pe] = prev[j];
-        if (Math.abs(ns - ps) < 0.25 && Math.abs(ne - pe) < 0.05) {
-          matched = true;
-          break;
-        }
-        // Range extended at the end
-        if (Math.abs(ns - ps) < 0.25 && ne > pe + 0.05) {
-          return { start: pe, end: ne };
-        }
-        // Range extended at the start
-        if (ns < ps - 0.05 && Math.abs(ne - pe) < 0.25) {
-          return { start: ns, end: ps };
+        if (ps <= ne + 0.5 && pe >= ns - 0.5) {
+          // Segment appended to the end of this buffered range
+          if (ne > pe + 0.08) {
+            return { start: pe, end: ne };
+          }
+          // Segment prepended to the start of this buffered range
+          if (ns < ps - 0.08 && Math.abs(ne - pe) < 0.5) {
+            return { start: ns, end: ps };
+          }
         }
       }
-      if (!matched) {
+    }
+
+    // 2. Check for a brand new disjoint range (e.g. after seeking to an unbuffered region)
+    for (let i = 0; i < next.length; i++) {
+      const [ns, ne] = next[i];
+      let overlapsAny = false;
+      for (let j = 0; j < prev.length; j++) {
+        const [ps, pe] = prev[j];
+        if (ps <= ne + 0.5 && pe >= ns - 0.5) {
+          overlapsAny = true;
+          break;
+        }
+      }
+      if (!overlapsAny) {
         return { start: ns, end: ne };
       }
     }
-    const last = next[next.length - 1];
-    return { start: Math.max(0, last[1] - 6.0), end: last[1] };
+
+    return null;
   }
 
   // Detect MP4 init segment (ftyp / moov) or WebM EBML header
   function isInitSegment(u8) {
     if (!u8 || u8.length < 8) return false;
-    // MP4 'ftyp' or 'moov' box in first 64 bytes
     const limit = Math.min(u8.length - 4, 64);
     for (let i = 4; i <= limit; i++) {
       if (
         (u8[i] === 0x66 && u8[i + 1] === 0x74 && u8[i + 2] === 0x79 && u8[i + 3] === 0x70) || // ftyp
         (u8[i] === 0x6d && u8[i + 1] === 0x6f && u8[i + 2] === 0x6f && u8[i + 3] === 0x76)    // moov
       ) {
-        // Check if it also contains 'moof' (some players combine init + first moof in one buffer)
         for (let j = i + 4; j < Math.min(u8.length - 4, 4096); j++) {
           if (u8[j] === 0x6d && u8[j + 1] === 0x6f && u8[j + 2] === 0x6f && u8[j + 3] === 0x66) {
             return "combined";
@@ -92,21 +104,19 @@
         return "pure_init";
       }
     }
-    // WebM EBML header: 0x1A 0x45 0xDF 0xA3
     if (u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3) {
       return "pure_init";
     }
     return false;
   }
 
-  // Queue batches in case content script loads slightly after document_start
   const pendingBatches = [];
   let playerReady = false;
 
   function emitBatch(batch) {
     if (!playerReady) {
       pendingBatches.push(batch);
-      if (pendingBatches.length > 15) pendingBatches.shift();
+      if (pendingBatches.length > 25) pendingBatches.shift();
       return;
     }
     const copy = batch.buffer.slice(0);
@@ -166,8 +176,13 @@
         };
 
         function flushTracker() {
-          if (tracker.fragments.length === 0) return;
-          // If a dedicated audio/ buffer exists on this page, skip muxed video/ buffers
+          if (tracker.fragments.length === 0 || tracker.batchStart === null) {
+            tracker.fragments = [];
+            tracker.totalBytes = 0;
+            tracker.batchStart = null;
+            tracker.batchEnd = null;
+            return;
+          }
           if (hasDedicatedAudioBuffer && !tracker.isDedicatedAudio) {
             tracker.fragments = [];
             tracker.totalBytes = 0;
@@ -190,7 +205,7 @@
             offset += p.byteLength;
           }
 
-          const startTime = tracker.batchStart ?? 0;
+          const startTime = tracker.batchStart;
           const endTime = tracker.batchEnd ?? (startTime + 6.0);
 
           tracker.fragments = [];
@@ -239,40 +254,39 @@
                   tracker.initChunk = clonedU8;
                 } else {
                   if (initType === "combined" && !tracker.initChunk) {
-                    // Combined init + first moof
                     tracker.initChunk = null;
                   }
                   const onUpdateEnd = () => {
                     try {
                       const nextRanges = getBufferedRanges(sbThis);
                       const added = findAddedRange(prevRanges, nextRanges);
-                      if (added) {
-                        // If user seeked or jumped far from current batch, flush old batch first
-                        if (tracker.batchEnd !== null && Math.abs(added.start - tracker.batchEnd) > 4.0) {
-                          flushTracker();
-                        }
-                        if (tracker.batchStart === null) {
-                          tracker.batchStart = added.start;
-                        }
-                        tracker.batchEnd = Math.max(tracker.batchEnd ?? added.end, added.end);
+
+                      // If user seeked to a new disjoint time range, flush previous batch first
+                      if (added && tracker.batchEnd !== null && Math.abs(added.start - tracker.batchEnd) > 2.5) {
+                        flushTracker();
+                        tracker.hasFlushedFirst = false;
                       }
 
                       tracker.fragments.push(clonedU8);
                       tracker.totalBytes += clonedU8.byteLength;
 
-                      const batchDur = (tracker.batchEnd !== null && tracker.batchStart !== null)
-                        ? (tracker.batchEnd - tracker.batchStart)
-                        : 0;
+                      if (added) {
+                        if (tracker.batchStart === null) {
+                          tracker.batchStart = added.start;
+                        }
+                        tracker.batchEnd = Math.max(tracker.batchEnd ?? added.end, added.end);
 
-                      // Flush first batch quickly (~3.5s+), then batch 2-3 segments (~9s+) to avoid flooding Engine on muxed streams
-                      const shouldFlush =
-                        (!tracker.hasFlushedFirst && (batchDur >= 3.5 || tracker.fragments.length >= 2)) ||
-                        (batchDur >= 9.0) ||
-                        (tracker.fragments.length >= 3) ||
-                        (tracker.totalBytes >= 3500000);
+                        const batchDur = tracker.batchEnd - tracker.batchStart;
 
-                      if (shouldFlush) {
-                        flushTracker();
+                        // First batch after start/seek flushes immediately (~3.2s+); subsequent batches group ~7.5s (~2 segments)
+                        const shouldFlush =
+                          (!tracker.hasFlushedFirst && batchDur >= 3.2) ||
+                          (batchDur >= 7.2) ||
+                          (tracker.totalBytes >= 4000000);
+
+                        if (shouldFlush) {
+                          flushTracker();
+                        }
                       }
                     } catch (e) {}
                   };
@@ -292,5 +306,5 @@
     origAddSourceBuffer
   );
 
-  console.log("[Movie Voice] MSE Audio Hook v4.1 ready.");
+  console.log("[Movie Voice] MSE Audio Hook v4.4 ready.");
 })();

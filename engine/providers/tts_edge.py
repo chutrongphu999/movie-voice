@@ -79,6 +79,7 @@ class EdgeTTS:
     def __init__(self, default_voice: str = "vi-VN-HoaiMyNeural"):
         self.default_voice = default_voice
         self._sem = asyncio.Semaphore(3)
+        self._edge_cooldown_until = 0.0
 
     def _get_cache_key(self, text: str, voice: str, rate: int, pitch: int) -> str:
         raw = f"{text}|{voice}|{rate}|{pitch}".encode("utf-8")
@@ -162,18 +163,21 @@ class EdgeTTS:
                 MEMORY_CACHE[cache_key] = (data, dur)
                 return data, dur, cache_key
 
-        # 3. Call Edge TTS with 3.5s timeout per attempt (max 2 attempts)
+        # 3. Call Edge TTS with fast 2.2s timeout (skip if Edge TTS recently failed/throttled)
+        import time
+        now = time.monotonic()
         async with self._sem:
-            for attempt in range(2):
+            if now >= self._edge_cooldown_until:
                 try:
                     audio_bytes = await asyncio.wait_for(
-                        self._run_edge_once(clean_text, voice_name, rate, pitch, use_custom=(attempt == 0)),
-                        timeout=3.5
+                        self._run_edge_once(clean_text, voice_name, rate, pitch, use_custom=True),
+                        timeout=2.2
                     )
                     if audio_bytes and len(audio_bytes) > 200:
                         return self._save_to_cache(cache_key, cache_file, audio_bytes)
                 except Exception:
-                    await asyncio.sleep(0.15)
+                    # Put Edge TTS on a 45s cooldown so subsequent lines use instant Google TTS (~0.2s) instead of stalling 6s
+                    self._edge_cooldown_until = time.monotonic() + 45.0
 
             # 4. Immediate fallback to Google Vietnamese TTS (~0.2s)
             try:
