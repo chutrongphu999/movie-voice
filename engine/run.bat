@@ -3,7 +3,7 @@ chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 title Movie Voice Engine (FastAPI + Groq + Gemini + TTS)
 echo ========================================================
-echo   MOVIE VOICE ENGINE - DUBBING & TRANSLATION SERVER
+echo   MOVIE VOICE ENGINE - DUBBING ^& TRANSLATION SERVER
 echo   Endpoint: http://127.0.0.1:8765
 echo ========================================================
 echo.
@@ -18,12 +18,9 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-echo [2/3] Kiem tra thu vien phu thuoc...
-".venv\Scripts\python.exe" -m pip install -r requirements.txt --quiet
-if errorlevel 1 (
-    echo [Loi] Cai dat thu vien that bai. Kiem tra ket noi internet.
-    pause
-    exit /b 1
+echo [2/3] Giai phong port 8765 neu dang bi chiem...
+for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8765 ^| findstr LISTENING') do (
+    taskkill /F /PID %%a >nul 2>&1
 )
 
 echo [3/3] Khoi dong Movie Voice Engine tai http://127.0.0.1:8765...
