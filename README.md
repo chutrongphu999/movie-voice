@@ -1,45 +1,34 @@
-# 🎬 Movie Voice v4 — Lồng Tiếng Phim AI Thời Gian Thực
+# 🎬 Movie Voice Studio v6 — Lồng Tiếng & Thuyết Minh Phim AI
 
-Hệ thống tự động nhận diện lời thoại và lồng tiếng phim trực tiếp ngay trên trang web bạn đang xem, độ trễ cực thấp, tối ưu cho việc chia sẻ xem chung qua **Google Meet**.
+Hệ thống thuyết minh phim tự động **khớp 100% phụ đề trên hình (Hard-Sub Vietsub)** và phát trực tiếp trên **Web Cinema Player** hoặc chia sẻ qua **Google Meet**.
 
 ---
 
 ## 🌟 Tính năng nổi bật
 
-1. **Xem trên mọi trang web phim:** Không cần mở tab player phụ, không cần tải lại video. Extension đọc ké trực tiếp dòng âm thanh mà trình phát phim đã tải trước (MSE Buffer).
-2. **Hỗ trợ phim Sub Cứng:** Trích xuất âm thanh gốc $\rightarrow$ nhận diện giọng nói siêu nhanh qua **Groq Whisper** $\rightarrow$ dịch ngữ cảnh theo lô qua **Gemini** $\rightarrow$ tạo giọng tiếng Việt qua **Edge TTS**.
-3. **Smart Ducking:** Tự động hạ âm lượng video gốc êm ái khi nhân vật cất tiếng lồng tiếng và phục hồi mượt mà sau khi câu thoại kết thúc.
-4. **Chia sẻ Google Meet hoàn hảo:** Toàn bộ âm thanh lồng tiếng phát ngay trong tab phim. Bạn chỉ cần chọn **Chia sẻ một thẻ Chrome** và tích **Chia sẻ âm thanh thẻ**.
+1. **Movie Voice Studio v6 (`http://127.0.0.1:8765`):**
+   - **Tải luồng `.m3u8` siêu tốc (24 luồng song song):** Chỉ cần bấm nút **`🎬 Studio`** trên trang xem phim (Motchill, RoPhim, Phimmoi...) hoặc chọn file `.mp4`/`.mkv` trên máy.
+   - **Khớp 100% Phụ Đề Trên Hình (`Hard-Sub Vietsub`):** Quét vùng phụ đề đáy video bằng OpenCV + Contact-Sheet Vision OCR để lấy chính xác từng chữ Tiếng Việt và đúng từng mili-giây chữ xuất hiện/biến mất.
+   - **Hỗ trợ File Phụ Đề Rời (`.srt` / `.vtt`) & Phim Raw (Groq Whisper ASR + Dịch ngữ cảnh Gemini).**
+   - **Hòa âm chuẩn phòng thu (Auto-Ducking 24kHz) & Đóng gói `.mp4` (`-c:v copy`):** Tự động hạ nhạc nền xuống 22% khi có tiếng thuyết minh, giữ nguyên 100% độ nét gốc và cho phép tua bất kỳ vị trí nào (`0ms` độ trễ).
 
 ---
 
-## 🚀 Hướng dẫn khởi động & Dùng thử
+## 🚀 Hướng dẫn cài đặt khi Clone sang máy mới
 
-### Bước 1: Khởi động Engine
-1. Mở thư mục `engine/`.
-2. Nhấp đúp vào file **`run.bat`**.
-3. Cửa sổ dòng lệnh sẽ tự động kiểm tra thư viện và thông báo:
-   ```
-   INFO: Uvicorn running on http://127.0.0.1:8765
-   ```
-*(Giữ cửa sổ này mở trong lúc xem phim).*
+### Bước 1: Clone dự án
+```powershell
+git clone https://github.com/chutrongphu999/movie-voice.git
+cd movie-voice
+```
 
----
+### Bước 2: Khởi động Engine & Studio
+1. Mở thư mục `engine/` và nhấp đúp vào **`run.bat`**.
+2. Ở lần chạy đầu tiên, `run.bat` sẽ **tự động tạo môi trường Python `.venv` và cài đặt toàn bộ thư viện** trong `requirements.txt`.
+3. Mở trình duyệt truy cập **[http://127.0.0.1:8765](http://127.0.0.1:8765)** (và điền `GEMINI_API_KEY` / `GROQ_API_KEY` vào file `engine/.env`).
 
-### Bước 2: Cài đặt Extension vào Chrome / Edge / Cốc Cốc
+### Bước 3: Cài đặt Extension vào Chrome / Edge / Cốc Cốc (Tùy chọn để bắt link `.m3u8` 1-Click)
 1. Mở trình duyệt, truy cập `chrome://extensions` (hoặc `edge://extensions`).
-2. Bật công tắc **Developer mode (Chế độ cho nhà phát triển)** ở góc trên bên phải.
-3. Bấm vào nút **Load unpacked (Tải tiện ích đã giải nén)** ở góc trên bên trái.
-4. Chọn thư mục: `F:\Movie Voice\extension`.
-5. Bạn sẽ thấy tiện ích **"Movie Voice - Lồng tiếng phim AI"** xuất hiện.
-
----
-
-### Bước 3: Xem phim & Chia sẻ Google Meet
-1. Mở bất kỳ trang web phim nào bạn muốn xem (Phimmoi, Motchill, Phim4k, RoPhim, Youtube...).
-2. Trên góc trên bên phải của video phim sẽ xuất hiện thanh điều khiển:
-   ```
-   [🎙️ LỒNG TIẾNG: BẬT]  Sẵn sàng
-   ```
-3. Bấm vào icon tiện ích trên thanh công cụ để chỉnh giọng (Hoài My / Nam Minh) hoặc mức ducking âm lượng.
-4. Vào Google Meet $\rightarrow$ **Chia sẻ màn hình** $\rightarrow$ chọn **Một thẻ Chrome** (thẻ phim đang mở) $\rightarrow$ **Bật "Chia sẻ âm thanh thẻ"**.
+2. Bật **Developer mode (Chế độ cho nhà phát triển)** ở góc trên bên phải.
+3. Bấm **Load unpacked (Tải tiện ích đã giải nén)** và chọn thư mục `extension` trong dự án.
+4. Khi mở trang web phim, bấm nút **`🎬 Studio`** trên thanh điều khiển video để chuyển thẳng link `.m3u8` sang Movie Voice Studio v6.
