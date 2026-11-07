@@ -25,9 +25,12 @@ import uuid
 import shutil
 import asyncio
 import subprocess
+import urllib.parse
+import concurrent.futures
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+import aiohttp
 import numpy as np
 
 from providers.tts_edge import EdgeTTS, FFMPEG_EXE, CACHE_DIR, clean_text_for_speech
@@ -278,11 +281,18 @@ class StudioManager:
         task.add_done_callback(lambda _t, jid=job_id: self.active_tasks.pop(jid, None))
         return job
 
+    def auto_resume_jobs(self):
+        """Automatically resumes any jobs that were interrupted by a server reload."""
+        for jid, job in list(self.jobs.items()):
+            if job.get("status") in ("interrupted", "running") and jid not in self.active_tasks:
+                print(f"[Studio] Auto-resuming interrupted job {jid} ({job.get('title')})...")
+                self.resume_job(jid)
+
     def delete_job(self, job_id: str) -> bool:
+        self.jobs.pop(job_id, None)
         task = self.active_tasks.pop(job_id, None)
         if task:
             task.cancel()
-        self.jobs.pop(job_id, None)
         job_dir = WORKSPACE_DIR / job_id
         if job_dir.exists():
             shutil.rmtree(job_dir, ignore_errors=True)
@@ -302,7 +312,7 @@ class StudioManager:
             cues_file = job_dir / "cues.json"
             if cues_file.exists():
                 cues = json.loads(cues_file.read_text(encoding="utf-8"))
-                self._update_progress(job_id, f"Đã nạp {len(cues)} câu phụ đề từ checkpoint.", 55.0)
+                self._update_progress(job_id, f"Đã nạp {len(cues)} câu phụ đề từ checkpoint.", 68.0)
             else:
                 cues = await self._extract_and_prepare_cues(job_id, job, job_dir, src_video)
                 cues_file.write_text(json.dumps(cues, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -329,22 +339,29 @@ class StudioManager:
                 status="completed"
             )
         except asyncio.CancelledError:
-            self._update_progress(job_id, "Đã hủy tiến trình.", job.get("progress", 0.0), status="cancelled")
+            if job_id in self.jobs:
+                self._update_progress(
+                    job_id,
+                    "Tạm dừng do máy chủ khởi động lại (Bấm Chạy Tiếp để hoàn tất).",
+                    job.get("progress", 0.0),
+                    status="interrupted"
+                )
         except Exception as e:
             import traceback
             traceback.print_exc()
             self._update_progress(job_id, f"❌ Lỗi: {str(e)}", job.get("progress", 0.0), status="error")
 
     async def _prepare_video_input(self, job_id: str, job: Dict[str, Any], job_dir: Path) -> Path:
-        """Prepares `source_video.mp4` (slicing [start_sec, end_sec] or downloading stream if needed)."""
+        """Prepares `source_video.mp4` (slicing [start_sec, end_sec] or downloading stream with 24 threads)."""
         target_mp4 = job_dir / "source_video.mp4"
-        if target_mp4.exists() and target_mp4.stat().st_size > 50_000:
+        if target_mp4.exists() and target_mp4.stat().st_size > 100_000:
             return target_mp4
 
         start_sec = float(job.get("start_sec", 0.0))
         end_sec = float(job.get("end_sec", 0.0))
         local_path = job.get("video_path", "").strip()
         stream_url = job.get("stream_url", "").strip()
+        temp_mp4 = job_dir / "temp_source.mp4"
 
         if local_path:
             src_p = Path(local_path)
@@ -361,12 +378,19 @@ class StudioManager:
                 cmd.extend(["-ss", f"{start_sec:.2f}"])
             if end_sec > start_sec:
                 cmd.extend(["-to", f"{end_sec:.2f}"])
-            cmd.extend(["-i", str(src_p), "-c", "copy", str(target_mp4)])
+            cmd.extend(["-i", str(src_p), "-c", "copy", str(temp_mp4)])
             await asyncio.to_thread(subprocess.run, cmd, check=True)
+            temp_mp4.replace(target_mp4)
             return target_mp4
 
         if stream_url:
-            self._update_progress(job_id, "Đang tải luồng video (.m3u8 / .mp4) về Studio...", 3.0)
+            if ".m3u8" in stream_url.lower():
+                try:
+                    return await self._download_hls_parallel(job_id, job, job_dir, target_mp4)
+                except Exception as e:
+                    print(f"[Studio] Parallel HLS downloader fallback to FFmpeg ({e})")
+
+            self._update_progress(job_id, "Đang tải luồng video (.mp4 / .m3u8) về Studio...", 3.0)
             cmd = [FFMPEG_EXE, "-hide_banner", "-loglevel", "error", "-y"]
             headers = []
             if job.get("referer"):
@@ -379,14 +403,184 @@ class StudioManager:
                 cmd.extend(["-ss", f"{start_sec:.2f}"])
             if end_sec > start_sec:
                 cmd.extend(["-to", f"{end_sec:.2f}"])
-            cmd.extend(["-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", str(target_mp4)])
+            cmd.extend(["-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", str(temp_mp4)])
             res = await asyncio.to_thread(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if res.returncode != 0 or not target_mp4.exists():
+            if res.returncode != 0 or not temp_mp4.exists():
                 err_txt = res.stderr.decode("utf-8", errors="ignore")[-250:]
                 raise RuntimeError(f"Không thể tải stream video ({err_txt}). Hãy tải file .mp4 về máy rồi chọn file.")
+            temp_mp4.replace(target_mp4)
             return target_mp4
 
         raise RuntimeError("Vui lòng chọn file video trên máy hoặc nhập link stream.")
+
+    async def _download_hls_parallel(
+        self,
+        job_id: str,
+        job: Dict[str, Any],
+        job_dir: Path,
+        target_mp4: Path
+    ) -> Path:
+        """
+        High-speed 24-thread parallel HLS (.m3u8) segment downloader with real-time progress bar
+        and instant checkpoint resume.
+        """
+        stream_url = job.get("stream_url", "").strip()
+        start_sec = float(job.get("start_sec", 0.0))
+        end_sec = float(job.get("end_sec", 0.0))
+
+        req_headers = {
+            "User-Agent": job.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36"
+        }
+        if job.get("referer"):
+            req_headers["Referer"] = job["referer"]
+
+        self._update_progress(job_id, "Đang phân tích danh sách phân đoạn video (.m3u8)...", 2.0)
+
+        timeout = aiohttp.ClientTimeout(total=60, connect=15)
+        connector = aiohttp.TCPConnector(limit=28, ssl=False)
+        async with aiohttp.ClientSession(headers=req_headers, timeout=timeout, connector=connector) as session:
+            async with session.get(stream_url) as resp:
+                resp.raise_for_status()
+                m3u8_text = await resp.text()
+                playlist_url = str(resp.url)
+
+            # Check if Master Playlist (#EXT-X-STREAM-INF) -> select highest quality variant
+            if "#EXT-X-STREAM-INF" in m3u8_text:
+                best_bw = -1
+                best_uri = ""
+                lines = [l.strip() for l in m3u8_text.splitlines() if l.strip()]
+                for i, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF"):
+                        bw_m = re.search(r"BANDWIDTH=(\d+)", line)
+                        bw = int(bw_m.group(1)) if bw_m else 0
+                        if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                            if bw >= best_bw:
+                                best_bw = bw
+                                best_uri = lines[i + 1]
+                if best_uri:
+                    playlist_url = urllib.parse.urljoin(playlist_url, best_uri)
+                    async with session.get(playlist_url) as resp2:
+                        resp2.raise_for_status()
+                        m3u8_text = await resp2.text()
+                        playlist_url = str(resp2.url)
+
+            # Parse segments & time range
+            hls_dir = job_dir / "hls_segs"
+            hls_dir.mkdir(parents=True, exist_ok=True)
+
+            local_m3u8_lines = []
+            segments_to_fetch = []  # (idx, seg_url, seg_file)
+            cur_time = 0.0
+            cur_dur = 4.0
+            seg_idx = 0
+
+            for raw_line in m3u8_text.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("#EXTINF:"):
+                    m_dur = re.search(r"#EXTINF:([\d\.]+)", line)
+                    cur_dur = float(m_dur.group(1)) if m_dur else 4.0
+                    continue
+                if line.startswith("#"):
+                    # Resolve relative URI inside #EXT-X-KEY or #EXT-X-MAP if present
+                    if 'URI="' in line:
+                        line = re.sub(
+                            r'URI="([^"]+)"',
+                            lambda m: f'URI="{urllib.parse.urljoin(playlist_url, m.group(1))}"',
+                            line
+                        )
+                    if not line.startswith("#EXT-X-ENDLIST"):
+                        local_m3u8_lines.append(line)
+                    continue
+
+                seg_start = cur_time
+                seg_end = cur_time + cur_dur
+                cur_time = seg_end
+
+                if start_sec > 0 and seg_end < start_sec:
+                    continue
+                if end_sec > start_sec and seg_start > end_sec:
+                    continue
+
+                seg_url = urllib.parse.urljoin(playlist_url, line)
+                local_name = f"seg_{seg_idx:05d}.ts"
+                seg_file = hls_dir / local_name
+                segments_to_fetch.append((seg_idx, seg_url, seg_file))
+                local_m3u8_lines.append(f"#EXTINF:{cur_dur:.3f},")
+                local_m3u8_lines.append(local_name)
+                seg_idx += 1
+
+            local_m3u8_lines.append("#EXT-X-ENDLIST")
+            total_segs = len(segments_to_fetch)
+            if total_segs == 0:
+                raise RuntimeError("Không tìm thấy phân đoạn .ts nào trong luồng .m3u8")
+
+            sem = asyncio.Semaphore(24)
+            done_count = 0
+            total_bytes = 0
+            last_report_t = 0.0
+
+            async def _fetch_one(idx: int, url: str, dest: Path):
+                nonlocal done_count, total_bytes, last_report_t
+                if dest.exists() and dest.stat().st_size > 512:
+                    done_count += 1
+                    total_bytes += dest.stat().st_size
+                    return
+
+                part_file = dest.with_suffix(".part")
+                async with sem:
+                    for attempt in range(4):
+                        try:
+                            async with session.get(url) as r:
+                                r.raise_for_status()
+                                data = await r.read()
+                            if data:
+                                part_file.write_bytes(data)
+                                part_file.replace(dest)
+                                total_bytes += len(data)
+                                break
+                        except Exception:
+                            if attempt == 3:
+                                raise
+                            await asyncio.sleep(0.6 * (attempt + 1))
+
+                done_count += 1
+                now = time.time()
+                if now - last_report_t >= 0.8 or done_count == total_segs:
+                    last_report_t = now
+                    mb = total_bytes / (1024.0 * 1024.0)
+                    pct = 2.0 + (done_count / float(total_segs)) * 16.5
+                    self._update_progress(
+                        job_id,
+                        f"Đang tải phim siêu tốc (24 luồng): {done_count}/{total_segs} phân đoạn ({mb:.1f} MB — {int(done_count * 100 / total_segs)}%)...",
+                        pct
+                    )
+
+            await asyncio.gather(*[_fetch_one(i, u, p) for i, u, p in segments_to_fetch])
+
+        # Remux downloaded segments into temp_source.mp4 then atomically rename to source_video.mp4
+        self._update_progress(job_id, "Đang ghép các phân đoạn video thành file MP4 chuẩn...", 19.0)
+        local_m3u8_file = hls_dir / "local_index.m3u8"
+        local_m3u8_file.write_text("\n".join(local_m3u8_lines), encoding="utf-8")
+        temp_mp4 = job_dir / "temp_source.mp4"
+
+        cmd = [
+            FFMPEG_EXE, "-hide_banner", "-loglevel", "error", "-y",
+            "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            "-i", str(local_m3u8_file),
+            "-c", "copy", "-bsf:a", "aac_adtstoasc",
+            str(temp_mp4)
+        ]
+        res = await asyncio.to_thread(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode != 0 or not temp_mp4.exists():
+            err_txt = res.stderr.decode("utf-8", errors="ignore")[-250:]
+            raise RuntimeError(f"Lỗi ghép file MP4 từ HLS: {err_txt}")
+
+        temp_mp4.replace(target_mp4)
+        shutil.rmtree(hls_dir, ignore_errors=True)
+        return target_mp4
 
     async def _extract_and_prepare_cues(
         self,
@@ -428,6 +622,7 @@ class StudioManager:
                 video_path=str(src_video),
                 start_sec=0.0,
                 end_sec=0.0,
+                total_duration=float(job.get("duration", 0.0)),
                 progress_cb=lambda msg, pct: self._update_progress(job_id, msg, pct)
             )
             if cues:
@@ -541,14 +736,14 @@ class StudioManager:
         cues: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """
-        Synthesizes TTS for all cues concurrently (4 workers) with silence trimming
+        Synthesizes TTS for all cues concurrently (8 workers) with silence trimming
         and WSOLA pitch-preserving time-fitting into each cue's [start, slot_end] window.
         """
         compute_non_overlapping_slots(cues)
         voice = job.get("voice", "vi-VN-HoaiMyNeural")
         rate = int(job.get("rate", 0))
         total = len(cues)
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(8)
         completed = 0
 
         async def _synth_one(idx: int, cue: Dict[str, Any]):
@@ -574,8 +769,8 @@ class StudioManager:
                     cue["audio_path"] = str(CACHE_DIR / f"{audio_id}.mp3")
                     cue["tts_duration"] = dur
                 completed += 1
-                if completed % 5 == 0 or completed == total:
-                    pct = 55.0 + (completed / float(max(1, total))) * 30.0
+                if completed % 3 == 0 or completed == total:
+                    pct = 68.0 + (completed / float(max(1, total))) * 20.0
                     self._update_progress(
                         job_id,
                         f"Đang tạo giọng thuyết minh ({completed}/{total} câu): \"{clean_vi[:40]}\"",
@@ -596,10 +791,11 @@ class StudioManager:
         """
         Sample-accurate NumPy Master Audio Mixer + Instant FFmpeg MP4 Muxer (-c:v copy).
         """
-        self._update_progress(job_id, "Đang trộn âm thanh Thuyết Minh + Nhạc nền tự động hạ âm lượng...", 88.0)
+        self._update_progress(job_id, "Đang trộn âm thanh Thuyết Minh + Nhạc nền tự động hạ âm lượng...", 88.5)
         output_mp4 = job_dir / "output_thuyetminh.mp4"
         await asyncio.to_thread(
             self._mix_and_mux_sync,
+            job_id,
             job_dir,
             src_video,
             cues_with_audio,
@@ -610,6 +806,7 @@ class StudioManager:
 
     def _mix_and_mux_sync(
         self,
+        job_id: str,
         job_dir: Path,
         src_video: Path,
         cues_with_audio: List[Dict[str, Any]],
@@ -637,17 +834,11 @@ class StudioManager:
         orig_samples = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32)
         total_samples = len(orig_samples)
 
-        # 2. Build smooth cosine auto-ducking envelope + overlay voiceover PCM at exact millisecond offsets
-        env = np.ones(total_samples, dtype=np.float32)
-        voice_track = np.zeros(total_samples, dtype=np.float32)
-        fade_len = int(0.18 * SR)  # 180ms smooth fade-in / fade-out around each spoken line
-
-        for idx, cue in enumerate(cues_with_audio):
+        # 2. Decode all cue MP3 files in parallel (8 threads) for fast mixing
+        def _decode_cue_mp3(cue: Dict[str, Any]):
             mp3_path = cue.get("audio_path")
             if not mp3_path or not Path(mp3_path).exists():
-                continue
-
-            # Decode MP3 to raw 24kHz s16le PCM via FFmpeg pipe
+                return None
             proc = subprocess.run(
                 [
                     FFMPEG_EXE, "-hide_banner", "-loglevel", "error",
@@ -658,16 +849,29 @@ class StudioManager:
                 stderr=subprocess.DEVNULL
             )
             if not proc.stdout:
-                continue
-
+                return None
             cue_pcm = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32)
             if len(cue_pcm) == 0:
-                continue
-
-            # Peak-normalize each voice clip to consistent studio broadcast presence
+                return None
             peak = float(np.max(np.abs(cue_pcm)))
             if peak > 500.0:
                 cue_pcm = cue_pcm * (26000.0 / peak)
+            return cue_pcm
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            decoded_pcms = list(pool.map(_decode_cue_mp3, cues_with_audio))
+
+        self._update_progress(job_id, "Đang hòa âm chuẩn phòng thu (Auto-Ducking 24kHz)...", 94.0)
+
+        # 3. Build smooth cosine auto-ducking envelope + overlay voiceover PCM at exact millisecond offsets
+        env = np.ones(total_samples, dtype=np.float32)
+        voice_track = np.zeros(total_samples, dtype=np.float32)
+        fade_len = int(0.18 * SR)  # 180ms smooth fade-in / fade-out around each spoken line
+
+        for idx, cue in enumerate(cues_with_audio):
+            cue_pcm = decoded_pcms[idx]
+            if cue_pcm is None:
+                continue
 
             start_idx = max(0, int(float(cue["start"]) * SR))
             if start_idx >= total_samples:
@@ -699,7 +903,7 @@ class StudioManager:
                 ramp_up = np.linspace(duck_level, 1.0, f_out_end - end_idx, dtype=np.float32)
                 env[end_idx:f_out_end] = np.minimum(env[end_idx:f_out_end], ramp_up)
 
-        # 3. Combine ducked original audio + normalized Vietnamese voiceover with soft limiter
+        # 4. Combine ducked original audio + normalized Vietnamese voiceover with soft limiter
         mixed = orig_samples * env + voice_track
         mixed = np.clip(mixed, -32760.0, 32760.0).astype(np.int16)
 
@@ -709,7 +913,9 @@ class StudioManager:
             wf.setframerate(SR)
             wf.writeframes(mixed.tobytes())
 
-        # 4. Mux original video (-c:v copy, 0 re-encoding!) + mixed Vietnamese dubbing track into MP4
+        self._update_progress(job_id, "Đang đóng gói file MP4 hoàn chỉnh (-c:v copy, giữ nguyên 100% nét gốc)...", 97.5)
+
+        # 5. Mux original video (-c:v copy, 0 re-encoding!) + mixed Vietnamese dubbing track into MP4
         mux_cmd = [
             FFMPEG_EXE, "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(src_video),

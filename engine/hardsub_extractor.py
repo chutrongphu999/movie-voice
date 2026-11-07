@@ -33,8 +33,8 @@ VISION_MODELS = [
 
 STRIP_W = 640
 STRIP_H = 104
-SCAN_FPS = 4.0  # 0.25s timestamp precision
-BATCH_STRIPS_PER_SHEET = 12
+SCAN_FPS = 2.5  # 0.40s timestamp precision (fast scan, catches all movie subtitles)
+BATCH_STRIPS_PER_SHEET = 16
 
 CONTACT_SHEET_PROMPT = """Bạn là hệ thống OCR đọc phụ đề phim chính xác tuyệt đối.
 Trong ảnh đính kèm là các dải phụ đề cắt từ đáy khung hình video, được xếp chồng từ trên xuống dưới và đánh số thứ tự ở lề trái (#1, #2, #3...).
@@ -151,30 +151,32 @@ class HardSubExtractor:
         video_path: str,
         start_sec: float = 0.0,
         end_sec: float = 0.0,
+        total_duration: float = 0.0,
         progress_cb: Optional[Callable[[str, float], None]] = None
     ) -> List[Dict[str, Any]]:
         """
         Full pipeline:
-        1. Scans bottom 23% of video via FFmpeg + OpenCV at 4 fps to detect subtitle [start, end] events.
-        2. Packs unique subtitle strips into numbered Contact Sheets (12 strips/sheet).
-        3. Runs Vision OCR to read exact Vietnamese/English subtitle text.
+        1. Scans bottom 28% of video via FFmpeg + OpenCV at 2.5 fps to detect subtitle [start, end] events.
+        2. Packs unique subtitle strips into numbered Contact Sheets (16 strips/sheet).
+        3. Runs Vision OCR (4 sheets in parallel) to read exact Vietnamese/English subtitle text.
         4. Deduplicates/merges identical adjacent cues and returns [{start, end, text}, ...].
         """
         if progress_cb:
-            progress_cb("Đang quét vùng phụ đề trên video bằng OpenCV...", 5.0)
+            progress_cb("Đang quét vùng phụ đề trên video bằng OpenCV...", 20.0)
 
         events = await asyncio.to_thread(
             self._scan_video_events_sync,
             video_path,
             start_sec,
             end_sec,
+            total_duration,
             progress_cb
         )
         if not events:
             return []
 
         if progress_cb:
-            progress_cb(f"Đã phát hiện {len(events)} khung phụ đề. Đang đọc chữ chính xác trên hình...", 30.0)
+            progress_cb(f"Đã phát hiện {len(events)} khung phụ đề. Đang đọc chữ chính xác trên hình...", 45.0)
 
         ocr_cues = await self._ocr_events_in_batches(events, progress_cb)
 
@@ -202,13 +204,14 @@ class HardSubExtractor:
         video_path: str,
         start_sec: float,
         end_sec: float,
+        total_duration: float = 0.0,
         progress_cb: Optional[Callable[[str, float], None]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Streams the bottom 23% of `video_path` through FFmpeg at 4 fps into OpenCV
+        Streams the bottom 28% of `video_path` through FFmpeg at 2.5 fps into OpenCV
         and detects every subtitle appearance, change, and disappearance.
         """
-        cmd = [FFMPEG_EXE, "-hide_banner", "-loglevel", "error"]
+        cmd = [FFMPEG_EXE, "-hide_banner", "-loglevel", "error", "-threads", "4"]
         if start_sec > 0:
             cmd.extend(["-ss", f"{start_sec:.2f}"])
         if end_sec > start_sec:
@@ -233,6 +236,7 @@ class HardSubExtractor:
         empty_streak = 0
         frame_idx = 0
         MIN_TEXT_PIXELS = 52
+        est_dur = max(10.0, total_duration if total_duration > 0 else 3600.0)
 
         try:
             while True:
@@ -300,10 +304,16 @@ class HardSubExtractor:
                             })
                         active_event = None
 
-                if frame_idx % 240 == 0 and progress_cb:
+                if frame_idx % 25 == 0 and progress_cb:
                     mins = int(t // 60)
                     secs = int(t % 60)
-                    progress_cb(f"Đang quét hình ảnh phụ đề tại phút {mins:02d}:{secs:02d} (đã thấy {len(events)} câu)...", 15.0)
+                    tot_m = int(est_dur // 60)
+                    tot_s = int(est_dur % 60)
+                    pct = 20.0 + min(24.5, (t / est_dur) * 24.5)
+                    progress_cb(
+                        f"Đang quét hình ảnh phụ đề: phút {mins:02d}:{secs:02d} / {tot_m:02d}:{tot_s:02d} (đã bắt được {len(events)} khung chữ)...",
+                        pct
+                    )
         finally:
             try:
                 if proc.stdout:
@@ -432,34 +442,43 @@ class HardSubExtractor:
         events: List[Dict[str, Any]],
         progress_cb: Optional[Callable[[str, float], None]] = None
     ) -> List[Dict[str, Any]]:
-        """Processes all detected subtitle events in Contact Sheet batches."""
-        results: List[Dict[str, Any]] = []
+        """Processes all detected subtitle events in parallel Contact Sheet batches (3 workers)."""
         total_events = len(events)
         batches = [
             events[i : i + BATCH_STRIPS_PER_SHEET]
             for i in range(0, total_events, BATCH_STRIPS_PER_SHEET)
         ]
+        batch_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(batches))]
+        sem = asyncio.Semaphore(3)
+        done_events = 0
 
-        for b_idx, batch in enumerate(batches):
-            jpeg_bytes = await asyncio.to_thread(self._build_contact_sheet_jpeg, batch)
-            mapping = await self._ocr_single_sheet(jpeg_bytes, len(batch))
-            for i, ev in enumerate(batch):
-                txt = mapping.get(i + 1, "")
-                if txt:
-                    results.append({
-                        "start": ev["start"],
-                        "end": ev["end"],
-                        "text": txt
-                    })
-            if progress_cb:
-                done_count = min(total_events, (b_idx + 1) * BATCH_STRIPS_PER_SHEET)
-                pct = 30.0 + (done_count / float(max(1, total_events))) * 25.0
-                sample = results[-1]["text"] if results else "..."
-                progress_cb(
-                    f"Đọc chữ phụ đề trên hình ({done_count}/{total_events} câu) — vừa đọc: \"{sample[:45]}\"",
-                    pct
-                )
-            # Gentle pacing between sheets
-            await asyncio.sleep(0.35)
+        async def _run_batch(b_idx: int, batch: List[Dict[str, Any]]):
+            nonlocal done_events
+            async with sem:
+                jpeg_bytes = await asyncio.to_thread(self._build_contact_sheet_jpeg, batch)
+                mapping = await self._ocr_single_sheet(jpeg_bytes, len(batch))
+                out_list = []
+                for i, ev in enumerate(batch):
+                    txt = mapping.get(i + 1, "")
+                    if txt:
+                        out_list.append({
+                            "start": ev["start"],
+                            "end": ev["end"],
+                            "text": txt
+                        })
+                batch_results[b_idx] = out_list
+                done_events = min(total_events, done_events + len(batch))
+                if progress_cb:
+                    pct = 45.0 + (done_events / float(max(1, total_events))) * 22.0
+                    sample = out_list[-1]["text"] if out_list else "..."
+                    progress_cb(
+                        f"Đọc chữ phụ đề trên hình ({done_events}/{total_events} câu) — vừa đọc: \"{sample[:45]}\"",
+                        pct
+                    )
+                await asyncio.sleep(0.25)
 
+        await asyncio.gather(*[_run_batch(i, b) for i, b in enumerate(batches)])
+        results: List[Dict[str, Any]] = []
+        for sub in batch_results:
+            results.extend(sub)
         return results

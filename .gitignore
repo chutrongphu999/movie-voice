@@ -10,6 +10,7 @@ server/.venv/
 # Cache & Storage
 .cache/
 engine/.cache/
+engine/workspace/
 server/.cache/
 *.log
 

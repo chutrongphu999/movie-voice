@@ -41,6 +41,11 @@ STUDIO_UI_FILE = Path(__file__).resolve().parent / "studio_ui.html"
 RECENT_CLIENT_LOGS: List[str] = []
 
 
+@app.on_event("startup")
+async def _on_startup():
+    studio.auto_resume_jobs()
+
+
 class SubtitleItem(BaseModel):
     start: float
     end: float
