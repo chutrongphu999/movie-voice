@@ -214,6 +214,24 @@
     };
   }
 
+  function formatMMSS(sec) {
+    const s = Math.max(0, Math.floor(sec || 0));
+    const m = Math.floor(s / 60);
+    const rem = s % 60;
+    return `${m}:${rem < 10 ? "0" : ""}${rem}`;
+  }
+
+  function updateReadyStatus() {
+    if (isSpeaking) return;
+    if (cueQueue.length > 0) {
+      setStatus(`Sẵn sàng (${cueQueue.length} câu · kế: ${formatMMSS(cueQueue[0].start)})`);
+    } else if (inFlightUploads > 0) {
+      setStatus("⚡ Đang dịch thoại...");
+    } else {
+      setStatus("Đang lắng nghe thoại...");
+    }
+  }
+
   // Enqueue cues and immediately prefetch their silence-trimmed MP3 audio bytes
   function enqueueCues(newCues) {
     if (!newCues || !newCues.length) return;
@@ -240,7 +258,7 @@
       subtitleHistory = subtitleHistory.slice(-100);
     }
     if (added > 0 && !isSpeaking) {
-      setStatus(`Sẵn sàng (${cueQueue.length} câu chờ đọc)`);
+      updateReadyStatus();
     }
   }
 
@@ -344,6 +362,7 @@
       activeSpeakingText = "";
       restoreDucking(false);
       renderSubBanner();
+      updateReadyStatus();
     }
   }
 
@@ -356,52 +375,60 @@
 
     const currTime = activeVideo.currentTime;
 
-    // 1. Only drop cues that the video has completely passed (> 2.2s past cue.end)
-    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 2.2) {
-      const dropped = cueQueue.shift();
-      sendClientLog("CUE_SKIPPED_LATE", `Skipped stale ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s at video=${currTime.toFixed(1)}s`);
-    }
-    if (cueQueue.length === 0) return;
-
-    // 2. If multiple cues piled up and currTime is already past the next cue's midpoint, advance to the current one
-    while (
-      cueQueue.length >= 2 &&
-      currTime >= cueQueue[1].start + Math.min(0.6, (cueQueue[1].end - cueQueue[1].start) * 0.4)
-    ) {
-      cueQueue.shift();
-    }
-
-    // 3. Do NOT cut off a speaking sentence early unless it has severely overrun its slot (+1.1s into next cue)
+    // 1. Check speaking state FIRST so we NEVER silently shift/drop upcoming cues while a line is speaking!
     if (isSpeaking) {
-      if (cueQueue.length > 0 && currTime >= Math.max(activeCueSlotEnd + 0.9, cueQueue[0].start + 1.1)) {
+      if (cueQueue.length > 0 && currTime >= Math.max(activeCueSlotEnd + 0.85, cueQueue[0].start + 1.05)) {
         stopCurrentSpeechOnly();
       } else {
         return;
       }
     }
 
+    // 2. Only drop cues that the video has completely passed (> 2.4s past cue.end)
+    let droppedAny = false;
+    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 2.4) {
+      const dropped = cueQueue.shift();
+      droppedAny = true;
+      sendClientLog("CUE_SKIPPED_LATE", `Skipped stale ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s at video=${currTime.toFixed(1)}s`);
+    }
+    if (cueQueue.length === 0) {
+      if (droppedAny) updateReadyStatus();
+      return;
+    }
+
+    // 3. Only skip cueQueue[0] if currTime is already past cueQueue[0].end + 0.8 AND past cueQueue[1].start + 0.4
+    while (
+      cueQueue.length >= 2 &&
+      currTime > cueQueue[0].end + 0.8 &&
+      currTime >= cueQueue[1].start + 0.4
+    ) {
+      cueQueue.shift();
+      droppedAny = true;
+    }
+    if (droppedAny) updateReadyStatus();
+
     const nextCue = cueQueue[0];
 
-    // 4. Trigger playback when playhead reaches nextCue.start (with 0.22s pre-roll)
-    if (currTime >= nextCue.start - 0.22 && currTime <= nextCue.end + 2.2) {
+    // 4. Trigger playback when playhead reaches nextCue.start (with 0.25s pre-roll)
+    if (currTime >= nextCue.start - 0.25 && currTime <= nextCue.end + 2.4) {
       cueQueue.shift();
       const slotEnd =
         cueQueue.length > 0
           ? Math.min(nextCue.slot_end || (nextCue.end + 0.35), cueQueue[0].start - 0.04)
           : (nextCue.slot_end || (nextCue.end + 0.5));
 
-      playCueNow(nextCue, Math.max(nextCue.start + 0.7, slotEnd));
+      playCueNow(nextCue, Math.max(nextCue.start + 0.65, slotEnd));
     }
   }, TICK_MS);
 
-  // Playhead-synchronized MSE Batch Scheduler (up to 3 concurrent requests within +45s lookahead)
+  // Strictly sequential Playhead-ordered MSE Batch Scheduler (inFlightUploads < 1, from rtsubs & LocalDub)
   async function processNextMseBatch() {
-    if (!config.enabled || hasSoftSubtitles || inFlightUploads >= 3 || pendingMseBatches.length === 0) return;
+    if (!config.enabled || hasSoftSubtitles || inFlightUploads >= 1 || pendingMseBatches.length === 0) return;
 
     const currTime = activeVideo ? activeVideo.currentTime : 0;
 
-    // 1. Prune batches that are far behind current playhead (> 60s old)
-    pendingMseBatches = pendingMseBatches.filter((b) => b.endTime >= currTime - 60.0);
+    // 1. Prune batches that have already passed (> 1.5s behind current playhead)
+    pendingMseBatches = pendingMseBatches.filter((b) => b.endTime >= currTime - 1.5);
 
     // 2. Sort ascending by startTime so we ALWAYS process earliest segments first
     pendingMseBatches.sort((a, b) => a.startTime - b.startTime);
@@ -426,7 +453,7 @@
 
     inFlightUploads++;
     if (!isSpeaking && cueQueue.length === 0) {
-      setStatus(`⚡ Đang dịch trước đoạn ${Math.floor(batch.startTime)}s...`);
+      setStatus(`⚡ Đang dịch đoạn ${formatMMSS(batch.startTime)}...`);
     }
 
     const movieTitle = extractMovieTitle();
@@ -476,8 +503,8 @@
 
       if (cues.length > 0) {
         enqueueCues(cues);
-      } else if (!isSpeaking && cueQueue.length === 0) {
-        setStatus("Đang lắng nghe thoại...");
+      } else if (!isSpeaking) {
+        updateReadyStatus();
       }
     } catch (err) {
       if (!isSpeaking) setStatus("Chưa kết nối Engine (run.bat)");
@@ -490,10 +517,10 @@
   }
 
   setInterval(() => {
-    if (config.enabled && !hasSoftSubtitles && pendingMseBatches.length > 0 && inFlightUploads < 3) {
+    if (config.enabled && !hasSoftSubtitles && pendingMseBatches.length > 0 && inFlightUploads < 1) {
       processNextMseBatch();
     }
-  }, 450);
+  }, 400);
 
   // Listen for MSE audio batches & intercepted .vtt/.srt subtitle files from mse-hook.js
   let fullSubFileCues = [];

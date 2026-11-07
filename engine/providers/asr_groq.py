@@ -32,23 +32,23 @@ HALLUCINATION_SUBSTRINGS = [
 ]
 
 HALLUCINATION_EXACT = {
-    "thank you",
-    "thanks",
-    "thank you very much",
     "you",
     "the",
     "a",
     "i",
-    "bye",
-    "bye bye",
-    "goodbye",
     "subscribe",
-    "cảm ơn",
     "uh",
     "um",
-    "ah",
-    "oh",
     "hmm",
+}
+
+SILENCE_ONLY_HALLUCINATION = {
+    "thank you",
+    "thanks",
+    "thank you very much",
+    "cảm ơn",
+    "bye",
+    "bye bye",
 }
 
 ASR_MODELS = [
@@ -76,7 +76,7 @@ def compute_pcm_rms(wav_bytes: bytes) -> float:
     return math.sqrt(sum_sq / len(subset))
 
 
-def is_hallucination_text(text: str, duration: float) -> bool:
+def is_hallucination_text(text: str, duration: float, no_speech_prob: float = 0.0) -> bool:
     """Checks if a transcribed segment is a Whisper silence/music/YouTube hallucination or stutter loop."""
     lower = text.lower().strip()
     for sub in HALLUCINATION_SUBSTRINGS:
@@ -93,6 +93,8 @@ def is_hallucination_text(text: str, duration: float) -> bool:
         return True
     if cleaned in HALLUCINATION_EXACT:
         return True
+    if cleaned in SILENCE_ONLY_HALLUCINATION and no_speech_prob > 0.50:
+        return True
 
     words = cleaned.split()
     unique_words = set(words)
@@ -101,7 +103,7 @@ def is_hallucination_text(text: str, duration: float) -> bool:
     if len(words) >= 4 and len(unique_words) <= 2:
         return True
 
-    if duration > 6.5 and len(words) <= 2:
+    if duration > 6.5 and len(words) <= 2 and no_speech_prob > 0.45:
         return True
 
     return False
@@ -159,7 +161,7 @@ class GroqASR:
                 "-y",
                 "-i", "pipe:0",
                 "-vn",
-                "-af", "highpass=f=100,lowpass=f=4200,dynaudnorm=f=150:g=11",
+                "-af", "highpass=f=85,lowpass=f=7600,dynaudnorm=f=250:g=15:p=0.9",
                 "-ac", "1",
                 "-ar", "16000",
                 "-f", "wav",
@@ -199,7 +201,7 @@ class GroqASR:
 
         # Skip near-silent chunks before calling Whisper API
         rms = compute_pcm_rms(wav_bytes)
-        if rms < 35.0:
+        if rms < 18.0:
             return []
 
         # Reset rolling prompt if user seeked far away
@@ -274,15 +276,15 @@ class GroqASR:
                 seg.get("compression_ratio", 1.0) if is_dict else getattr(seg, "compression_ratio", 1.0)
             )
 
-            # Standard Whisper silence/garbage filter (AND condition, never dropping real dialogue over music)
-            if (no_speech_prob > 0.65 and avg_logprob < -1.0) or avg_logprob < -1.55 or compression_ratio > 2.4:
+            # Relaxed Whisper filter (from rtsubs: no_speech_prob < 0.85, keeping quiet whispers & short calls)
+            if (no_speech_prob > 0.85 and avg_logprob < -1.25) or avg_logprob < -1.85 or compression_ratio > 2.6:
                 continue
-            if start >= wav_duration - 0.15:
+            if start >= wav_duration - 0.05:
                 continue
 
-            end = min(end, wav_duration + 0.2)
+            end = min(end, wav_duration + 0.25)
             seg_dur = end - start
-            if not text or seg_dur < 0.2:
+            if not text or seg_dur < 0.10:
                 continue
 
             norm = text.lower()
@@ -291,7 +293,7 @@ class GroqASR:
             if text_counts.get(norm, 0) >= 3:
                 continue
 
-            if is_hallucination_text(text, seg_dur):
+            if is_hallucination_text(text, seg_dur, no_speech_prob):
                 continue
 
             prev_norm = norm

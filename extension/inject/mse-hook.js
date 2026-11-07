@@ -233,7 +233,7 @@
     if (!next || next.length === 0) return null;
     if (!prev || prev.length === 0) {
       const first = next[next.length - 1];
-      return { start: Math.max(first[0], first[1] - 5.0), end: first[1] };
+      return { start: first[0], end: first[1] };
     }
 
     // 1. Check overlapping ranges between prev and next (immune to back-buffer eviction at ns)
@@ -242,10 +242,10 @@
       for (let j = 0; j < prev.length; j++) {
         const [ps, pe] = prev[j];
         if (ps <= ne + 0.5 && pe >= ns - 0.5) {
-          if (ne > pe + 0.08) {
+          if (ne > pe + 0.05) {
             return { start: pe, end: ne };
           }
-          if (ns < ps - 0.08 && Math.abs(ne - pe) < 0.5) {
+          if (ns < ps - 0.05 && Math.abs(ne - pe) < 0.5) {
             return { start: ns, end: ps };
           }
         }
@@ -338,7 +338,7 @@
           hasFlushedFirst: false
         };
 
-        function flushTracker(keepOverlap = true) {
+        function flushTracker() {
           if (tracker.fragments.length === 0 || tracker.batchStart === null || !tracker.initChunk) {
             tracker.fragments = [];
             tracker.fragMeta = [];
@@ -366,31 +366,11 @@
           const startTime = tracker.batchStart;
           const endTime = tracker.batchEnd ?? (startTime + 6.0);
 
-          // Keep last fragment (if <= 4.5s) as sliding overlap so sentences at chunk boundaries are never cut in half
-          const lastIdx = tracker.fragments.length - 1;
-          const lastMeta = tracker.fragMeta[lastIdx];
-          const lastFrag = tracker.fragments[lastIdx];
-          const canOverlap =
-            keepOverlap &&
-            tracker.fragments.length >= 2 &&
-            lastMeta &&
-            (lastMeta.end - lastMeta.start) >= 1.2 &&
-            (lastMeta.end - lastMeta.start) <= 4.5 &&
-            lastFrag.byteLength < 800000;
-
-          if (canOverlap) {
-            tracker.fragments = [lastFrag];
-            tracker.fragMeta = [lastMeta];
-            tracker.totalBytes = lastFrag.byteLength;
-            tracker.batchStart = lastMeta.start;
-            tracker.batchEnd = lastMeta.end;
-          } else {
-            tracker.fragments = [];
-            tracker.fragMeta = [];
-            tracker.totalBytes = 0;
-            tracker.batchStart = null;
-            tracker.batchEnd = null;
-          }
+          tracker.fragments = [];
+          tracker.fragMeta = [];
+          tracker.totalBytes = 0;
+          tracker.batchStart = null;
+          tracker.batchEnd = null;
           tracker.hasFlushedFirst = true;
 
           emitBatch({
@@ -451,8 +431,13 @@
                         const nextRanges = getBufferedRanges(sbThis);
                         const added = findAddedRange(prevRanges, nextRanges);
 
-                        if (added && tracker.batchEnd !== null && Math.abs(added.start - tracker.batchEnd) > 2.5) {
-                          flushTracker(false);
+                        // Never push a fragment whose timestamp range could not be determined when batchStart is null
+                        if (!added && tracker.batchStart === null) {
+                          return;
+                        }
+
+                        if (added && tracker.batchEnd !== null && Math.abs(added.start - tracker.batchEnd) > 2.0) {
+                          flushTracker();
                           tracker.hasFlushedFirst = false;
                         }
 
@@ -468,14 +453,14 @@
 
                           const batchDur = tracker.batchEnd - tracker.batchStart;
 
-                          // First batch after start/seek flushes at ~4.8s; subsequent batches group ~10.0s with 1-fragment overlap
+                          // First batch after start/seek flushes at ~4.5s; subsequent batches group ~8.0s
                           const shouldFlush =
-                            (!tracker.hasFlushedFirst && batchDur >= 4.8) ||
-                            (batchDur >= 10.0) ||
-                            (tracker.totalBytes >= 4000000);
+                            (!tracker.hasFlushedFirst && batchDur >= 4.5) ||
+                            (batchDur >= 8.0) ||
+                            (tracker.totalBytes >= 3500000);
 
                           if (shouldFlush) {
-                            flushTracker(true);
+                            flushTracker();
                           }
                         }
                       } catch (e) {}
