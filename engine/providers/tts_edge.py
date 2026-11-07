@@ -50,27 +50,40 @@ def clean_text_for_speech(text: str) -> str:
     return text
 
 
-def trim_silence_and_measure_mp3(raw_mp3: bytes) -> Tuple[bytes, float]:
+def trim_silence_and_measure_mp3(raw_mp3: bytes, target_slot: float = 0.0) -> Tuple[bytes, float]:
     """
-    Uses FFmpeg to strip Edge-TTS leading/trailing silence (200-350ms dead air)
+    Uses FFmpeg to strip Edge-TTS leading/trailing silence (200-350ms dead air),
+    applies pitch-preserving WSOLA time-fitting (atempo <= 1.25, from rtsubs/tts.py load_fitted)
+    if needed to fit target_slot without changing voice pitch,
     and outputs CBR 64kbps MP3 where byte length / 8000.0 gives exact duration to +-0.02s.
     """
     if not raw_mp3 or len(raw_mp3) < 200:
         return raw_mp3, 0.0
 
     try:
+        # Edge-TTS raw stream is 48kbps CBR (6000 bytes/sec) with ~0.28s leading+trailing silence
+        est_trimmed_dur = max(0.25, (len(raw_mp3) / 6000.0) - 0.28)
+        tempo = 1.0
+        if target_slot and target_slot >= 0.5 and est_trimmed_dur > target_slot * 1.03:
+            # Cap at 1.25x so speech always sounds natural and calm while preserving 100% original pitch
+            tempo = min(1.25, max(1.0, est_trimmed_dur / target_slot))
+
+        af_chain = (
+            "silenceremove=start_periods=1:start_silence=0.03:start_threshold=-42dB,"
+            "areverse,"
+            "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-42dB,"
+            "areverse"
+        )
+        if tempo > 1.02:
+            af_chain = f"{af_chain},atempo={tempo:.4f}"
+
         cmd = [
             FFMPEG_EXE,
             "-hide_banner",
             "-loglevel", "error",
             "-y",
             "-i", "pipe:0",
-            "-af", (
-                "silenceremove=start_periods=1:start_silence=0.03:start_threshold=-42dB,"
-                "areverse,"
-                "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-42dB,"
-                "areverse"
-            ),
+            "-af", af_chain,
             "-ac", "1",
             "-ar", "24000",
             "-c:a", "libmp3lame",
@@ -174,8 +187,18 @@ class EdgeTTS:
                             audio_parts.append(data)
         return b"".join(audio_parts)
 
-    async def _save_to_cache(self, cache_key: str, cache_file: Path, raw_audio_bytes: bytes) -> Tuple[bytes, float, str]:
-        trimmed_bytes, duration = await asyncio.to_thread(trim_silence_and_measure_mp3, raw_audio_bytes)
+    async def _save_to_cache(
+        self,
+        cache_key: str,
+        cache_file: Path,
+        raw_audio_bytes: bytes,
+        target_slot: float = 0.0
+    ) -> Tuple[bytes, float, str]:
+        trimmed_bytes, duration = await asyncio.to_thread(
+            trim_silence_and_measure_mp3,
+            raw_audio_bytes,
+            target_slot
+        )
         cache_file.write_bytes(trimmed_bytes)
         if len(MEMORY_CACHE) >= MAX_MEMORY_CACHE:
             for k in list(MEMORY_CACHE.keys())[:50]:
@@ -188,11 +211,12 @@ class EdgeTTS:
         text: str,
         voice: str = None,
         rate: int = 0,
-        pitch: int = 0
+        pitch: int = 0,
+        target_slot: float = 0.0
     ) -> Tuple[bytes, float, str]:
         """
-        Synthesizes text to silence-trimmed CBR 64k MP3 audio bytes using Microsoft Edge Neural Voice,
-        returning (audio_bytes, exact_duration_sec, cache_key).
+        Synthesizes text to silence-trimmed, pitch-preserving slot-fitted CBR 64k MP3 audio bytes
+        using Microsoft Edge Neural Voice, returning (audio_bytes, exact_duration_sec, cache_key).
         """
         clean_text = clean_text_for_speech(text)
         if not clean_text or len(clean_text) < 2:
@@ -215,23 +239,26 @@ class EdgeTTS:
                 MEMORY_CACHE[cache_key] = (data, dur)
                 return data, dur, cache_key
 
-        # 3. Call Edge Neural TTS inside semaphore
+        # Default +8% cadence gives HoaiMyNeural / NamMinhNeural a crisp professional thuyết minh pace
+        effective_rate = rate + 8
+
+        # 3. Call Edge Neural TTS inside semaphore (6.5s timeout so it never aborts mid-synthesis at 3.5s)
         async with self._sem:
             try:
                 audio_bytes = await asyncio.wait_for(
-                    self._run_edge_once(clean_text, voice_name, rate, pitch, use_custom=True),
-                    timeout=3.5
+                    self._run_edge_once(clean_text, voice_name, effective_rate, pitch, use_custom=True),
+                    timeout=6.5
                 )
                 if audio_bytes and len(audio_bytes) > 200:
-                    return await self._save_to_cache(cache_key, cache_file, audio_bytes)
+                    return await self._save_to_cache(cache_key, cache_file, audio_bytes, target_slot=target_slot)
             except Exception:
                 pass
 
-            # 4. Per-line fallback to Google Vietnamese TTS (~0.2s) if Edge failed
+            # 4. Per-line fallback to Google Vietnamese TTS only if Edge truly failed
             try:
                 g_bytes = await self._synthesize_google_tts(clean_text)
                 if g_bytes and len(g_bytes) > 200:
-                    return await self._save_to_cache(cache_key, cache_file, g_bytes)
+                    return await self._save_to_cache(cache_key, cache_file, g_bytes, target_slot=target_slot)
             except Exception as e:
                 raise RuntimeError(f"Both Edge TTS and Google TTS fallback failed: {e}")
 

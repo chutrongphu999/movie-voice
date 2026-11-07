@@ -21,7 +21,7 @@ GEMINI_MODELS = [
     "gemini-2.5-flash-lite",
 ]
 
-CHARS_PER_SEC = 17.5  # Vietnamese natural speaking rate budget for dubbing slots
+CHARS_PER_SEC = 13.5  # Vietnamese natural speaking rate budget for dubbing slots (matches HoaiMyNeural cadence)
 
 SYSTEM_PROMPT = """Bạn là dịch giả thuyết minh/lồng tiếng phim chuyên nghiệp, dịch lời thoại sang tiếng Việt tự nhiên, chuẩn xác và trôi chảy. Bản dịch sẽ được đọc to (TTS) khớp vào khung thời gian của từng câu gốc.
 
@@ -32,11 +32,11 @@ SYSTEM_PROMPT = """Bạn là dịch giả thuyết minh/lồng tiếng phim chuy
    - translate: các câu cần dịch theo thứ tự thoại, mỗi câu là {"id": số, "src": lời thoại gốc, "max_chars": giới hạn ký tự tối đa cho phép}.
 
 # Quy tắc bắt buộc:
-1. Nguồn là nhận dạng giọng nói (ASR) từ phim nên có thể bị nghe nhầm từ đồng âm hoặc tên riêng (ví dụ: 'Stard' -> 'Stark', 'Chico Thanos' -> 'Thanos'). Hãy dựa vào TÊN PHIM, STORY BIBLE và ngữ cảnh để tự hiệu đính về đúng nghĩa trong phim rồi dịch tự nhiên sang tiếng Việt.
+1. Nguồn là nhận dạng giọng nói (ASR) từ phim nên có thể bị nghe nhầm từ đồng âm hoặc tên riêng (ví dụ: 'Stard' -> 'Stark', 'Chico Thanos' -> 'Thanos', 'oriental leg' -> 'prosthetic leg'). Hãy dựa vào TÊN PHIM, STORY BIBLE và ngữ cảnh để tự hiệu đính về đúng nghĩa trong phim rồi dịch tự nhiên sang tiếng Việt.
 2. Tuyệt đối KHÔNG dịch word-by-word máy móc. Dịch thoát ý, khẩu ngữ đời thực như phim chiếu rạp/HTV3 (ví dụ: 'Look,' -> 'Nghe này,'; 'What is wrong with you?' -> 'Cậu bị làm sao thế?'; 'I got this' -> 'Để tôi lo').
 3. Xưng hô nhất quán theo vai và quan hệ nhân vật trong phim (anh - em, cậu - tớ, tôi - ông/bà, ngài - tôi, mày - tao).
 4. Mỗi id được đọc to riêng lẻ nên phải là một câu/cụm trọn nghĩa, nghe tự nhiên khi đứng một mình. KHÔNG kết thúc bằng dấu phẩy, chấm phẩy hay hai chấm; bắt buộc kết thúc bằng . ? !
-5. Súc tích, ưu tiên không vượt quá max_chars để vừa khít khẩu hình nhân vật; nếu câu gốc dài thì lược bỏ từ đệm, giữ trọn ý chính.
+5. Súc tích, gọn gàng, KHÔNG vượt quá max_chars để giọng đọc thuyết minh luôn giữ tốc độ tự nhiên vừa khít khẩu hình nhân vật; nếu câu gốc dài thì cô đọng ý chính, bỏ từ đệm.
 6. Mỗi id trả về đúng 1 bản dịch, không gộp, không tách, không bỏ sót id nào.
 7. Chỉ trả về DUY NHẤT một JSON hợp lệ, không Markdown: {"items":[{"id":0,"vi":"..."},{"id":1,"vi":"..."}]}"""
 
@@ -45,9 +45,9 @@ UNDERSTAND_SYSTEM = """Bạn là biên tập viên kịch bản lồng tiếng p
 Trả về DUY NHẤT một JSON object hợp lệ, không Markdown, với các khóa:
 - synopsis: tóm tắt bối cảnh/cốt truyện phim và đoạn đang chiếu, tiếng Việt, tối đa 70 từ.
 - genre_tone: thể loại và giọng điệu (ví dụ: "Phim hành động siêu anh hùng Marvel, kịch tính"), tối đa 20 từ.
-- characters: tối đa 15 nhân vật chính trong phim/đoạn thoại. Mỗi mục {"name": tên gốc, "vi": cách gọi tiếng Việt, "gender": "nam"|"nữ"|"?", "role": vai trò, "calls": cách xưng hô điển hình}.
-- terminology: object {"thuật ngữ/địa danh/tên riêng gốc": "cách dịch hoặc giữ nguyên chuẩn trong tiếng Việt"}, tối đa 30 mục (ví dụ: {"Tesseract": "khối Tesseract", "Avengers": "Biệt đội Avengers"}).
-- asr_fixes: object {"từ ASR nghe nhầm": "từ đúng trong phim"}, tối đa 25 mục (ví dụ: {"Stard": "Stark", "Chico Thanos": "Thanos"})."""
+- characters: tối đa 15 nhân vật thật sự của bộ phim (TUYỆT ĐỐI KHÔNG đặt tên chung chung như AVENGER 1, SPEAKER 1). Mỗi mục {"name": tên gốc chuẩn, "vi": cách gọi tiếng Việt, "gender": "nam"|"nữ"|"?", "role": vai trò, "calls": cách xưng hô điển hình}.
+- terminology: object {"thuật ngữ/địa danh/tên riêng gốc": "cách dịch hoặc giữ nguyên chuẩn trong tiếng Việt"}, tối đa 30 mục (ví dụ: {"Tesseract": "khối Tesseract", "Infinity Stones": "Đá Vô Cực"}).
+- asr_fixes: object {"từ tiếng Anh/ngôn ngữ gốc bị ASR nghe nhầm": "từ tiếng Anh/ngôn ngữ gốc đúng trong phim"}, tối đa 25 mục (ví dụ: {"Stard": "Stark", "Chico Thanos": "Thanos", "oriental leg": "prosthetic leg"}). KHÔNG đưa bản dịch tiếng Việt vào asr_fixes."""
 
 BIBLE_KEYS = ("synopsis", "genre_tone", "characters", "terminology", "asr_fixes")
 
@@ -101,12 +101,14 @@ class Translator:
 
     def set_movie_title(self, title: str):
         clean_title = re.sub(r"\s+", " ", (title or "").strip())
-        # Strip common streaming site suffixes
+        # Strip common streaming site prefixes & suffixes
+        clean_title = re.sub(r"(?i)^xem\s+(phim\s+)?", "", clean_title).strip()
         clean_title = re.sub(
-            r"(?i)\s*[-|–]\s*(xem phim|phimmoi|motchill|motphim|kkphim|ophim|phim4k|rophim|full hd|vietsub|thuyết minh).*$",
+            r"(?i)\s*[-|–]\s*(xem phim|phimmoi|motchill|motphim|kkphim|ophim|phim4k|rophim|full hd|vietsub|thuyết minh|tập).*$",
             "",
             clean_title
         ).strip()
+        clean_title = re.sub(r"(?i)\s+(full\s+hd|hd|vietsub|thuyết\s+minh)$", "", clean_title).strip()
         if not clean_title or len(clean_title) < 2:
             return
         if clean_title != self.movie_title:
@@ -118,28 +120,20 @@ class Translator:
             self.trigger_bible_update_if_needed(force=True)
 
     def get_whisper_glossary_hint(self) -> str:
-        """Returns character names & key terms to feed into Whisper's prompt so it recognizes proper nouns."""
-        parts = []
-        if self.movie_title:
-            parts.append(self.movie_title)
-        chars = self.bible.get("characters") or []
-        char_names = [str(c.get("name", "")).strip() for c in chars if isinstance(c, dict) and c.get("name")]
-        if char_names:
-            parts.append(", ".join(char_names[:10]))
-        terms = self.bible.get("terminology") or {}
-        if isinstance(terms, dict) and terms:
-            parts.append(", ".join(list(terms.keys())[:10]))
-        return ". ".join(p for p in parts if p)[:180]
+        """Deprecated for Whisper prompt (kept for compatibility); Story Bible lives in the Translator."""
+        return ""
 
     def apply_asr_fixes(self, text: str) -> str:
-        """Applies known ASR mishearing fixes from Story Bible before translation."""
+        """Applies known ASR mishearing fixes from Story Bible before translation (ignoring Vietnamese target values)."""
         fixes = self.bible.get("asr_fixes")
         if not isinstance(fixes, dict) or not fixes or not text:
             return text
+        vi_chars = set("àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ")
         out = text
         for wrong, right in fixes.items():
-            if wrong and right and len(wrong) >= 3:
-                out = re.sub(rf"\b{re.escape(str(wrong))}\b", str(right), out, flags=re.IGNORECASE)
+            w_str, r_str = str(wrong or "").strip(), str(right or "").strip()
+            if len(w_str) >= 3 and r_str and not any(ch in vi_chars for ch in r_str.lower()):
+                out = re.sub(rf"\b{re.escape(w_str)}\b", r_str, out, flags=re.IGNORECASE)
         return out
 
     def record_source_cues(self, cues: List[Dict[str, Any]]):
@@ -182,12 +176,18 @@ class Translator:
         try:
             raw_resp = ""
             if self.groq_key:
-                raw_resp = await self._call_groq_messages(
-                    [{"role": "system", "content": UNDERSTAND_SYSTEM}, {"role": "user", "content": user_msg}],
-                    model_name=GROQ_MODELS[0],
-                    max_tokens=1200,
-                    timeout=7.0
-                )
+                for m in reversed(GROQ_MODELS):
+                    try:
+                        raw_resp = await self._call_groq_messages(
+                            [{"role": "system", "content": UNDERSTAND_SYSTEM}, {"role": "user", "content": user_msg}],
+                            model_name=m,
+                            max_tokens=2500,
+                            timeout=9.0
+                        )
+                        if raw_resp and "{" in raw_resp:
+                            break
+                    except Exception:
+                        continue
             elif self.gemini_key:
                 raw_resp = await self._translate_gemini(f"{UNDERSTAND_SYSTEM}\n\n{user_msg}", GEMINI_MODELS[0])
 

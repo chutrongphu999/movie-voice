@@ -25,6 +25,13 @@ HALLUCINATION_SUBSTRINGS = [
     "subtitles by",
     "amara.org",
     "transcribed by",
+    "castingwords",
+    "in the description",
+    "avenger 1",
+    "avenger 2",
+    "avenger 3",
+    "speaker 1",
+    "speaker 2",
     "hy vọng bạn thích video",
     "chào mừng đến với tập đầu tiên",
     "cảm ơn các bạn đã xem",
@@ -204,24 +211,14 @@ class GroqASR:
         if rms < 18.0:
             return []
 
-        # Reset rolling prompt if user seeked far away
-        if abs(time_offset - self._last_offset) > 25.0:
-            self._last_prompt = ""
-        self._last_offset = time_offset
-
         language = os.getenv("ASR_LANGUAGE", "auto").strip().lower()
-        prompt_parts = []
-        if glossary_hint:
-            prompt_parts.append(glossary_hint[:110])
-        if self._last_prompt:
-            prompt_parts.append(self._last_prompt[-120:])
-        prompt_hint = " | ".join(prompt_parts) if prompt_parts else None
 
         result = None
         for attempt in range(3):
             chosen_model = ASR_MODELS[(self._model_idx + attempt) % len(ASR_MODELS)]
             try:
                 def _call_groq(m=chosen_model):
+                    # Follow rtsubs/asr.py: NEVER pass prompt to Whisper so it never echoes glossary/previous text on BGM
                     kwargs = dict(
                         file=("chunk.wav", wav_bytes),
                         model=m,
@@ -230,8 +227,6 @@ class GroqASR:
                     )
                     if language and language != "auto":
                         kwargs["language"] = language
-                    if prompt_hint:
-                        kwargs["prompt"] = prompt_hint
                     return self.client.audio.transcriptions.create(**kwargs)
 
                 result = await asyncio.to_thread(_call_groq)
@@ -276,8 +271,8 @@ class GroqASR:
                 seg.get("compression_ratio", 1.0) if is_dict else getattr(seg, "compression_ratio", 1.0)
             )
 
-            # Relaxed Whisper filter (from rtsubs: no_speech_prob < 0.85, keeping quiet whispers & short calls)
-            if (no_speech_prob > 0.85 and avg_logprob < -1.25) or avg_logprob < -1.85 or compression_ratio > 2.6:
+            # Match rtsubs/asr.py: drop non-speech / BGM segments (no_speech_prob >= 0.78)
+            if no_speech_prob >= 0.78 or avg_logprob < -1.45 or compression_ratio > 2.4:
                 continue
             if start >= wav_duration - 0.05:
                 continue

@@ -32,6 +32,7 @@ app.add_middleware(
 )
 
 pipeline = DubbingPipeline()
+RECENT_CLIENT_LOGS: List[str] = []
 
 
 class SubtitleItem(BaseModel):
@@ -76,8 +77,27 @@ async def health_check():
 @app.post("/api/dub/client-log")
 async def client_log(item: ClientLogItem):
     """Prints browser dubbing playback events directly to the Engine terminal for easy debugging."""
-    print(f"[Browser] {item.event} | {item.detail}")
+    line = f"[Browser] {item.event} | {item.detail}"
+    print(line)
+    RECENT_CLIENT_LOGS.append(line)
+    if len(RECENT_CLIENT_LOGS) > 120:
+        del RECENT_CLIENT_LOGS[:40]
     return {"ok": True}
+
+
+@app.get("/api/debug/state")
+async def debug_state():
+    """Returns recent client logs, spoken cues, and Story Bible state for live debugging."""
+    return {
+        "movie_title": pipeline.translator.movie_title,
+        "bible_summary": {
+            "characters": len(pipeline.translator.bible.get("characters", [])),
+            "terminology": len(pipeline.translator.bible.get("terminology", {})),
+            "asr_fixes": pipeline.translator.bible.get("asr_fixes", {})
+        },
+        "recent_spoken_cues": pipeline.spoken_cues[-25:],
+        "recent_client_logs": RECENT_CLIENT_LOGS[-50:]
+    }
 
 
 @app.post("/api/dub/audio")

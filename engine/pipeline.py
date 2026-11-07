@@ -13,8 +13,9 @@ from providers.tts_edge import EdgeTTS, CACHE_DIR, MEMORY_CACHE, clean_text_for_
 
 def compute_non_overlapping_slots(cues: List[Dict[str, Any]]) -> List[float]:
     """
-    Computes the exact available speaking window (slot in seconds) for each cue
-    so a sentence never overflows into the next sentence (from rtsubs/pipeline.py).
+    Computes:
+    1. c["slot_end"]: the true non-overlapping playback ceiling (allowing natural breathing room into pauses up to +1.8s).
+    2. slots (returned list): the tighter speaking duration budget passed to the LLM translator for max_chars.
     """
     slots: List[float] = []
     n = len(cues)
@@ -23,11 +24,13 @@ def compute_non_overlapping_slots(cues: List[Dict[str, Any]]) -> List[float]:
         end = float(c.get("end", start + 2.0))
         if i + 1 < n:
             next_start = float(cues[i + 1].get("start", end + 0.5))
-            effective_end = min(end + 0.35, next_start - 0.04)
+            effective_end = min(end + 1.8, next_start - 0.06)
         else:
-            effective_end = end + 0.45
-        c["slot_end"] = round(max(start + 0.65, effective_end), 2)
-        slots.append(round(max(0.8, c["slot_end"] - start), 2))
+            effective_end = end + 1.8
+        c["slot_end"] = round(max(start + 1.1, effective_end), 2)
+        # Keep translation budget tight to actor's original phrase duration (+0.45s) bounded by slot_end
+        translate_budget = min(max(1.1, (end - start) + 0.45), c["slot_end"] - start)
+        slots.append(round(max(1.0, translate_budget), 2))
     return slots
 
 
@@ -38,6 +41,8 @@ class DubbingPipeline:
         self.tts = EdgeTTS()
         # Session state: track processed cue times to avoid duplicate lines & keep rolling dialogue context
         self.spoken_cues: List[Dict[str, Any]] = []
+        self._last_time_offset: float = -999.0
+        self._segment_cache: Dict[tuple, List[Dict[str, Any]]] = {}
         # In-flight background TTS tasks: audio_id -> asyncio.Task
         self.tts_tasks: Dict[str, asyncio.Task] = {}
 
@@ -97,11 +102,11 @@ class DubbingPipeline:
         pitch: int
     ) -> List[Dict[str, Any]]:
         """
-        Starts TTS synthesis for all cues in parallel background tasks, awaits ONLY the first cue
-        so the response returns immediately while remaining cues finish in the background.
+        Starts TTS synthesis (with silence-trimming + pitch-preserving WSOLA slot-fitting)
+        for all cues in parallel background tasks and returns cues immediately (~0.00s wait)
+        so the browser can immediately prefetch all voice URLs in parallel and start uploading the next MSE batch.
         """
         out_cues = []
-        first_task = None
 
         for cue, vi_text in cues_and_texts:
             clean_vi = clean_text_for_speech(vi_text)
@@ -111,23 +116,28 @@ class DubbingPipeline:
             voice_name = voice or self.tts.default_voice
             audio_id = self.tts._get_cache_key(clean_vi, voice_name, rate, pitch)
 
-            # Initial estimate (~16.5 chars/sec after silence trim) until exact CBR 64k MP3 is measured
-            est_dur = round(max(0.7, len(clean_vi) / 16.5), 2)
+            # Initial estimate (~14.5 chars/sec at +8% cadence) until exact CBR 64k MP3 is measured
+            est_dur = round(max(0.7, len(clean_vi) / 14.5), 2)
             if audio_id in MEMORY_CACHE:
                 est_dur = MEMORY_CACHE[audio_id][1]
 
             start = float(cue.get("start", 0.0))
             end = float(cue.get("end", start + est_dur))
-            slot_end = float(cue.get("slot_end", end + 0.35))
+            slot_end = float(cue.get("slot_end", end + 1.5))
+            target_slot = round(max(1.0, slot_end - start), 2)
 
             if audio_id not in self.tts_tasks and not (CACHE_DIR / f"{audio_id}.mp3").exists():
                 task = asyncio.create_task(
-                    self.tts.synthesize(text=clean_vi, voice=voice_name, rate=rate, pitch=pitch)
+                    self.tts.synthesize(
+                        text=clean_vi,
+                        voice=voice_name,
+                        rate=rate,
+                        pitch=pitch,
+                        target_slot=target_slot
+                    )
                 )
                 self.tts_tasks[audio_id] = task
                 task.add_done_callback(lambda _t, aid=audio_id: self.tts_tasks.pop(aid, None))
-                if first_task is None:
-                    first_task = task
 
             out_cues.append({
                 "id": audio_id,
@@ -139,15 +149,6 @@ class DubbingPipeline:
                 "duration": est_dur,
                 "audio_url": f"/api/dub/voice/{audio_id}"
             })
-
-        # Wait only for the 1st cue's audio so it is immediately ready when the browser receives the response
-        if first_task is not None:
-            try:
-                _, actual_dur, _ = await first_task
-                if out_cues and actual_dur > 0:
-                    out_cues[0]["duration"] = actual_dur
-            except Exception as e:
-                print(f"[Pipeline] First cue TTS error: {e}")
 
         self.spoken_cues.extend(out_cues)
         if len(self.spoken_cues) > 200:
@@ -165,8 +166,8 @@ class DubbingPipeline:
     ) -> List[Dict[str, Any]]:
         """
         Receives an audio chunk captured by MSE/HLS hook,
-        runs ASR with Story Bible glossary hint, translates with slot-based max_chars budget,
-        and schedules parallel silence-trimmed TTS.
+        runs ASR, translates with Story Bible + slot-based max_chars budget,
+        and schedules parallel silence-trimmed pitch-fitted TTS.
         """
         if not audio_bytes or len(audio_bytes) < 1000:
             return []
@@ -174,12 +175,23 @@ class DubbingPipeline:
         if movie_title:
             self.translator.set_movie_title(movie_title)
 
+        seg_key = (round(time_offset, 1), len(audio_bytes), voice or self.tts.default_voice, rate, pitch)
+        if seg_key in self._segment_cache:
+            cached_cues = self._segment_cache[seg_key]
+            self._last_time_offset = time_offset
+            return cached_cues
+
+        # If user seeked backwards, reloaded the same segment, or jumped far ahead, clear spoken_cues
+        if self._last_time_offset >= 0 and (
+            time_offset <= self._last_time_offset + 0.5 or abs(time_offset - self._last_time_offset) > 35.0
+        ):
+            self.spoken_cues.clear()
+        self._last_time_offset = time_offset
+
         t0 = time.monotonic()
-        glossary_hint = self.translator.get_whisper_glossary_hint()
         raw_cues = await self.asr.transcribe(
             audio_bytes,
-            time_offset=time_offset,
-            glossary_hint=glossary_hint
+            time_offset=time_offset
         )
         if not raw_cues:
             return []
@@ -213,6 +225,10 @@ class DubbingPipeline:
         t_tts = time.monotonic() - t2
 
         if synthesized_cues:
+            self._segment_cache[seg_key] = synthesized_cues
+            if len(self._segment_cache) > 120:
+                oldest = next(iter(self._segment_cache))
+                self._segment_cache.pop(oldest, None)
             first_t = synthesized_cues[0]["start"]
             last_t = synthesized_cues[-1]["end"]
             sample = synthesized_cues[0]["text"][:55]

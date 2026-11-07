@@ -108,6 +108,7 @@
   let fadeInterval = null;
   let restoreTimeout = null;
   let inFlightUploads = 0;
+  let seekGeneration = 0;
   let pendingMseBatches = [];
   let hasSoftSubtitles = false;
 
@@ -224,7 +225,8 @@
   function updateReadyStatus() {
     if (isSpeaking) return;
     if (cueQueue.length > 0) {
-      setStatus(`Sẵn sàng (${cueQueue.length} câu · kế: ${formatMMSS(cueQueue[0].start)})`);
+      const readyCount = cueQueue.filter((c) => c.audioReady).length;
+      setStatus(`Sẵn sàng (${readyCount}/${cueQueue.length} câu · kế: ${formatMMSS(cueQueue[0].start)})`);
     } else if (inFlightUploads > 0) {
       setStatus("⚡ Đang dịch thoại...");
     } else {
@@ -232,25 +234,70 @@
     }
   }
 
-  // Enqueue cues and immediately prefetch their silence-trimmed MP3 audio bytes
+  const masterCueCache = new Map();
+
+  function restoreCuesAround(t) {
+    cueQueue = [];
+    seenCueKeys.clear();
+    for (const [key, cue] of masterCueCache.entries()) {
+      if (!cue.audioFailed && cue.end >= t - 0.8 && cue.start <= t + 75.0) {
+        cueQueue.push(cue);
+        seenCueKeys.add(key);
+      }
+    }
+    cueQueue.sort((a, b) => a.start - b.start);
+  }
+
+  // Enqueue cues and immediately prefetch + pre-decode their silence-trimmed MP3 audio in background
   function enqueueCues(newCues) {
     if (!newCues || !newCues.length) return;
+    const currTime = activeVideo ? activeVideo.currentTime : 0;
     let added = 0;
-    for (const cue of newCues) {
-      const key = `${Math.round(cue.start * 2)}:${cue.text}`;
-      if (seenCueKeys.has(key)) continue;
-      seenCueKeys.add(key);
-      if (seenCueKeys.size > 400) {
-        const firstKey = seenCueKeys.values().next().value;
-        seenCueKeys.delete(firstKey);
+    for (const rawCue of newCues) {
+      const key = `${Math.round(rawCue.start * 2)}:${rawCue.text}`;
+      let cue = masterCueCache.get(key);
+      if (!cue) {
+        cue = rawCue;
+        cue.audioReady = false;
+        cue.audioFailed = false;
+        cue.payload = null;
+        cue.decodedBuffer = null;
+
+        cue.audioPromise = (async () => {
+          try {
+            const payload = await fetchVoicePayload(cue.audio_url);
+            if (!payload || !payload.arrayBuf) throw new Error("Empty voice payload");
+            cue.payload = payload;
+            const ctx = getAudioContext();
+            if (ctx) {
+              try {
+                cue.decodedBuffer = await ctx.decodeAudioData(payload.arrayBuf.slice(0));
+              } catch (_) {}
+            }
+            cue.audioReady = true;
+            if (!isSpeaking) updateReadyStatus();
+            return payload;
+          } catch (err) {
+            cue.audioFailed = true;
+            sendClientLog("PREFETCH_ERR", String(err));
+            return null;
+          }
+        })();
+
+        masterCueCache.set(key, cue);
+        if (masterCueCache.size > 350) {
+          const oldestKey = masterCueCache.keys().next().value;
+          masterCueCache.delete(oldestKey);
+        }
+        subtitleHistory.push({ start: cue.start, end: cue.slot_end || (cue.end + 1.5), text: cue.text });
       }
 
-      cue.audioPromise = fetchVoicePayload(cue.audio_url).catch((err) => {
-        sendClientLog("PREFETCH_ERR", String(err));
-        return null;
-      });
+      if (activeVideo && currTime > 0.5 && (cue.end < currTime - 1.8 || cue.start > currTime + 75.0)) {
+        continue;
+      }
+      if (seenCueKeys.has(key)) continue;
+      seenCueKeys.add(key);
       cueQueue.push(cue);
-      subtitleHistory.push({ start: cue.start, end: cue.slot_end || (cue.end + 0.35), text: cue.text });
       added++;
     }
     cueQueue.sort((a, b) => a.start - b.start);
@@ -262,20 +309,18 @@
     }
   }
 
-  // Zero-Drift Time-Stretching Playback (from LocalDub & real-time-video-subs)
+  // Pitch-Preserved Playback (Server FFmpeg WSOLA atempo handles primary fitting; WebAudio stays in 0.98x..1.12x natural range)
   async function playCueNow(cue, slotEnd) {
     if (!config.enabled || !activeVideo || activeVideo.paused) return;
+    const playGen = seekGeneration;
     isSpeaking = true;
     activeCueSlotEnd = slotEnd;
     activeSpeakingText = cue.text;
     renderSubBanner();
 
     try {
-      const payload = await (cue.audioPromise || fetchVoicePayload(cue.audio_url));
-      if (!payload || !payload.arrayBuf || !config.enabled || !activeVideo || activeVideo.paused) {
-        isSpeaking = false;
-        activeSpeakingText = "";
-        renderSubBanner();
+      const payload = cue.payload || (await cue.audioPromise);
+      if (!payload || !payload.arrayBuf || !config.enabled || !activeVideo || activeVideo.paused || playGen !== seekGeneration) {
         return;
       }
 
@@ -286,7 +331,7 @@
       if (ctx && ctx.state === "suspended") {
         await Promise.race([
           ctx.resume().catch(() => {}),
-          new Promise((r) => setTimeout(r, 200))
+          new Promise((r) => setTimeout(r, 150))
         ]);
       }
 
@@ -296,19 +341,14 @@
       let playedViaWebAudio = false;
       if (ctx && ctx.state === "running") {
         try {
-          const decoded = await ctx.decodeAudioData(payload.arrayBuf.slice(0));
+          const decoded = cue.decodedBuffer || (await ctx.decodeAudioData(payload.arrayBuf.slice(0)));
           const nowTime = activeVideo.currentTime;
-          const availWindow = Math.max(0.45, slotEnd - Math.max(nowTime, cue.start));
+          const availWindow = Math.max(0.65, slotEnd - Math.max(nowTime, cue.start));
 
-          // Zero-Drift Time-Stretching: dynamically stretch/compress to fit exact remaining scene window
+          // Server FFmpeg atempo already time-fitted the MP3 with pitch preservation;
+          // keep WebAudio rate within 0.98x..1.12x so voice pitch and speed stay 100% natural and steady!
           const fitRate = decoded.duration / availWindow;
-          const playbackRate = Math.max(0.95, Math.min(1.48, Math.max(baseSpeed, fitRate)));
-
-          // If cue arrived slightly after cue.start and even 1.48x exceeds availWindow, offset slightly into audio
-          let startOffset = 0;
-          if (nowTime > cue.start + 0.55 && decoded.duration / playbackRate > availWindow + 0.3) {
-            startOffset = Math.min(decoded.duration * 0.22, Math.max(0, (nowTime - cue.start - 0.55) * 0.35));
-          }
+          const playbackRate = Math.max(0.98, Math.min(1.12, Math.max(baseSpeed, fitRate)));
 
           playedViaWebAudio = true;
           sendClientLog(
@@ -326,7 +366,7 @@
               currentSourceNode = null;
               resolve();
             };
-            source.start(0, startOffset);
+            source.start(0);
           });
         } catch (webAudioErr) {
           sendClientLog("WEBAUDIO_ERR", String(webAudioErr));
@@ -339,9 +379,9 @@
           fallbackAudioEl.src = dataUrl;
           fallbackAudioEl.onloadedmetadata = () => {
             const nowTime = activeVideo ? activeVideo.currentTime : cue.start;
-            const availWindow = Math.max(0.45, slotEnd - Math.max(nowTime, cue.start));
+            const availWindow = Math.max(0.65, slotEnd - Math.max(nowTime, cue.start));
             const audioDur = fallbackAudioEl.duration || cue.duration || 2.0;
-            const playbackRate = Math.max(0.95, Math.min(1.48, Math.max(baseSpeed, audioDur / availWindow)));
+            const playbackRate = Math.max(0.98, Math.min(1.22, Math.max(baseSpeed, audioDur / availWindow)));
             fallbackAudioEl.preservesPitch = true;
             fallbackAudioEl.playbackRate = playbackRate;
             sendClientLog("PLAY_FALLBACK (HTML5Audio)", `${cue.start.toFixed(1)}s (rate=${playbackRate.toFixed(2)}x) | "${cue.text}"`);
@@ -377,30 +417,36 @@
 
     // 1. Check speaking state FIRST so we NEVER silently shift/drop upcoming cues while a line is speaking!
     if (isSpeaking) {
-      if (cueQueue.length > 0 && currTime >= Math.max(activeCueSlotEnd + 0.85, cueQueue[0].start + 1.05)) {
+      if (cueQueue.length > 0 && cueQueue[0].audioReady && currTime >= Math.max(activeCueSlotEnd + 0.65, cueQueue[0].start + 0.95)) {
         stopCurrentSpeechOnly();
       } else {
         return;
       }
     }
 
-    // 2. Only drop cues that the video has completely passed (> 2.4s past cue.end)
+    // 2. Drop cues that failed synthesis or that the video has completely passed (> 1.8s past cue.end)
     let droppedAny = false;
-    while (cueQueue.length > 0 && currTime > cueQueue[0].end + 2.4) {
+    while (
+      cueQueue.length > 0 &&
+      (cueQueue[0].audioFailed || currTime > cueQueue[0].end + 1.8)
+    ) {
       const dropped = cueQueue.shift();
       droppedAny = true;
-      sendClientLog("CUE_SKIPPED_LATE", `Skipped stale ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s at video=${currTime.toFixed(1)}s`);
+      if (!dropped.audioFailed) {
+        sendClientLog("CUE_SKIPPED_LATE", `Skipped stale ${dropped.start.toFixed(1)}s..${dropped.end.toFixed(1)}s at video=${currTime.toFixed(1)}s`);
+      }
     }
     if (cueQueue.length === 0) {
       if (droppedAny) updateReadyStatus();
       return;
     }
 
-    // 3. Only skip cueQueue[0] if currTime is already past cueQueue[0].end + 0.8 AND past cueQueue[1].start + 0.4
+    // 3. Only skip cueQueue[0] if currTime is already past cueQueue[0].end + 0.6 AND cueQueue[1] is ready and due
     while (
       cueQueue.length >= 2 &&
-      currTime > cueQueue[0].end + 0.8 &&
-      currTime >= cueQueue[1].start + 0.4
+      currTime > cueQueue[0].end + 0.6 &&
+      currTime >= cueQueue[1].start &&
+      cueQueue[1].audioReady
     ) {
       cueQueue.shift();
       droppedAny = true;
@@ -409,26 +455,38 @@
 
     const nextCue = cueQueue[0];
 
-    // 4. Trigger playback when playhead reaches nextCue.start (with 0.25s pre-roll)
-    if (currTime >= nextCue.start - 0.25 && currTime <= nextCue.end + 2.4) {
+    // 4. Trigger playback when playhead reaches nextCue.start (with 0.20s pre-roll)
+    if (currTime >= nextCue.start - 0.20 && currTime <= nextCue.end + 1.8) {
+      if (!nextCue.audioReady) {
+        // Do NOT shift or block with isSpeaking=true while audio is still downloading; wait for audioReady
+        setStatus(`⚡ Đang tải giọng đọc (${formatMMSS(nextCue.start)})...`);
+        return;
+      }
       cueQueue.shift();
       const slotEnd =
         cueQueue.length > 0
-          ? Math.min(nextCue.slot_end || (nextCue.end + 0.35), cueQueue[0].start - 0.04)
-          : (nextCue.slot_end || (nextCue.end + 0.5));
+          ? Math.min(nextCue.slot_end || (nextCue.end + 1.6), cueQueue[0].start - 0.05)
+          : (nextCue.slot_end || (nextCue.end + 1.6));
 
-      playCueNow(nextCue, Math.max(nextCue.start + 0.65, slotEnd));
+      playCueNow(nextCue, Math.max(nextCue.start + 0.85, slotEnd));
     }
   }, TICK_MS);
 
-  // Strictly sequential Playhead-ordered MSE Batch Scheduler (inFlightUploads < 1, from rtsubs & LocalDub)
+  let inFlightBatch = null;
+
+  // Strict Playhead-Ordered MSE Batch Scheduler
   async function processNextMseBatch() {
     if (!config.enabled || hasSoftSubtitles || inFlightUploads >= 1 || pendingMseBatches.length === 0) return;
 
     const currTime = activeVideo ? activeVideo.currentTime : 0;
+    const nowMs = Date.now();
 
-    // 1. Prune batches that have already passed (> 1.5s behind current playhead)
-    pendingMseBatches = pendingMseBatches.filter((b) => b.endTime >= currTime - 1.5);
+    // 1. Prune batches that have already passed (> 1.5s behind current playhead), unless just appended (< 8s ago) for a seek
+    if (!activeVideo || !activeVideo.seeking) {
+      pendingMseBatches = pendingMseBatches.filter(
+        (b) => b.endTime >= currTime - 1.5 || (nowMs - (b.appendedAt || 0) < 8000)
+      );
+    }
 
     // 2. Sort ascending by startTime so we ALWAYS process earliest segments first
     pendingMseBatches.sort((a, b) => a.startTime - b.startTime);
@@ -437,11 +495,19 @@
     let targetIdx = -1;
     for (let i = 0; i < pendingMseBatches.length; i++) {
       const b = pendingMseBatches[i];
-      if (b.endTime >= currTime - 0.5) {
-        if (currTime === 0 || b.startTime <= currTime + 45.0) {
-          targetIdx = i;
-        }
+      if (b.endTime >= currTime - 0.5 && (currTime <= 1.0 || b.startTime <= currTime + 45.0)) {
+        targetIdx = i;
         break;
+      }
+    }
+
+    // Fallback: if hls.js just appended segments for a seek target before video.currentTime updated, pick the earliest fresh batch
+    if (targetIdx === -1) {
+      for (let i = 0; i < pendingMseBatches.length; i++) {
+        if (nowMs - (pendingMseBatches[i].appendedAt || 0) < 8000) {
+          targetIdx = i;
+          break;
+        }
       }
     }
 
@@ -451,7 +517,8 @@
 
     const [batch] = pendingMseBatches.splice(targetIdx, 1);
 
-    inFlightUploads++;
+    inFlightUploads = 1;
+    inFlightBatch = batch;
     if (!isSpeaking && cueQueue.length === 0) {
       setStatus(`⚡ Đang dịch đoạn ${formatMMSS(batch.startTime)}...`);
     }
@@ -479,7 +546,7 @@
         });
         if (res && res.ok) {
           cues = res.cues || [];
-        } else if (res && res.error && !isSpeaking) {
+        } else if (res && res.error && !isSpeaking && inFlightBatch === batch) {
           setStatus(`Lỗi Engine: ${res.error.slice(0, 45)}`);
         }
       } else {
@@ -507,9 +574,12 @@
         updateReadyStatus();
       }
     } catch (err) {
-      if (!isSpeaking) setStatus("Chưa kết nối Engine (run.bat)");
+      if (!isSpeaking && inFlightBatch === batch) setStatus("Chưa kết nối Engine (run.bat)");
     } finally {
-      inFlightUploads--;
+      if (inFlightBatch === batch) {
+        inFlightBatch = null;
+        inFlightUploads = 0;
+      }
       if (pendingMseBatches.length > 0) {
         processNextMseBatch();
       }
@@ -520,7 +590,7 @@
     if (config.enabled && !hasSoftSubtitles && pendingMseBatches.length > 0 && inFlightUploads < 1) {
       processNextMseBatch();
     }
-  }, 400);
+  }, 350);
 
   // Listen for MSE audio batches & intercepted .vtt/.srt subtitle files from mse-hook.js
   let fullSubFileCues = [];
@@ -588,7 +658,8 @@
       mimeType: event.data.mimeType,
       startTime,
       endTime,
-      buffer: event.data.buffer
+      buffer: event.data.buffer,
+      appendedAt: Date.now()
     });
 
     pendingMseBatches.sort((a, b) => a.startTime - b.startTime);
@@ -744,17 +815,49 @@
 
     video.addEventListener("seeking", () => {
       if (video === activeVideo) {
+        seekGeneration++;
+        const t = video.currentTime;
         stopCurrentSpeechOnly();
-        setStatus("Đang đồng bộ vị trí mới...");
+        restoreCuesAround(t);
+        if (
+          inFlightBatch &&
+          Date.now() - (inFlightBatch.appendedAt || 0) >= 6000 &&
+          (inFlightBatch.endTime < t - 2.0 || inFlightBatch.startTime > t + 50.0)
+        ) {
+          inFlightBatch = null;
+          inFlightUploads = 0;
+        }
+        if (cueQueue.length > 0) {
+          updateReadyStatus();
+        } else {
+          setStatus("Đang đồng bộ vị trí mới...");
+        }
       }
     });
 
     video.addEventListener("seeked", () => {
       if (video === activeVideo) {
-        lastSubBatchSentTo = video.currentTime - 0.5;
-        sendClientLog("VIDEO_SEEKED", `currentTime=${video.currentTime.toFixed(1)}s, queuedBatches=${pendingMseBatches.length}`);
+        seekGeneration++;
+        const t = video.currentTime;
+        stopCurrentSpeechOnly();
+        restoreCuesAround(t);
+        if (
+          inFlightBatch &&
+          Date.now() - (inFlightBatch.appendedAt || 0) >= 6000 &&
+          (inFlightBatch.endTime < t - 2.0 || inFlightBatch.startTime > t + 50.0)
+        ) {
+          inFlightBatch = null;
+          inFlightUploads = 0;
+        }
+        const nowMs = Date.now();
+        pendingMseBatches = pendingMseBatches.filter(
+          (b) => (b.endTime >= t - 1.5 && b.startTime <= t + 45.0) || (nowMs - (b.appendedAt || 0) < 8000)
+        );
+        lastSubBatchSentTo = t - 0.5;
+        sendClientLog("VIDEO_SEEKED", `currentTime=${t.toFixed(1)}s, queuedBatches=${pendingMseBatches.length}, restoredCues=${cueQueue.length}`);
         processNextMseBatch();
         pumpSoftSubtitleFile();
+        updateReadyStatus();
       }
     });
   }
