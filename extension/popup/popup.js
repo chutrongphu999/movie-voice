@@ -9,6 +9,12 @@ document.addEventListener("DOMContentLoaded", () => {
   const sliderRate = document.getElementById("sliderRate");
   const rateVal = document.getElementById("rateVal");
   const btnTestVoice = document.getElementById("btnTestVoice");
+  const btnOpenStudio = document.getElementById("btnOpenStudio");
+  if (btnOpenStudio) {
+    btnOpenStudio.addEventListener("click", () => {
+      chrome.tabs.create({ url: `${ENGINE_URL}/` });
+    });
+  }
 
   // Load saved config
   chrome.storage.sync.get({

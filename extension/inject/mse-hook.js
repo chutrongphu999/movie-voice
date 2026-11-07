@@ -76,6 +76,22 @@
     }
   }
 
+  let lastStreamUrl = "";
+  function emitStreamUrl(url) {
+    if (!url || typeof url !== "string" || !url.startsWith("http")) return;
+    if (url === lastStreamUrl) return;
+    lastStreamUrl = url;
+    window.postMessage(
+      {
+        type: "__MOVIE_VOICE_STREAM_URL__",
+        url,
+        referer: window.location.href,
+        userAgent: navigator.userAgent
+      },
+      "*"
+    );
+  }
+
   try {
     const origFetch = window.fetch;
     if (typeof origFetch === "function") {
@@ -84,6 +100,9 @@
           apply(target, thisArg, args) {
             const reqUrl = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
             const p = Reflect.apply(target, thisArg, args);
+            if (/\.m3u8(\?|$)/i.test(reqUrl)) {
+              emitStreamUrl(reqUrl);
+            }
             if (/\.(vtt|srt)(\?|$)/i.test(reqUrl)) {
               p.then((resp) => {
                 if (resp && resp.ok) {
@@ -103,6 +122,9 @@
       new Proxy(origXhrOpen, {
         apply(target, thisArg, args) {
           const url = String(args[1] || "");
+          if (/\.m3u8(\?|$)/i.test(url)) {
+            emitStreamUrl(url);
+          }
           if (/\.(vtt|srt)(\?|$)/i.test(url)) {
             thisArg.addEventListener("load", function () {
               try {

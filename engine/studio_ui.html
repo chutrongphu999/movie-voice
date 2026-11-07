@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Movie Voice Studio v6 — Lồng Tiếng Khớp 100% Phụ Đề Trên Hình</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --panel: #131a2a;
+      --panel-2: #1a2338;
+      --border: rgba(255, 255, 255, 0.09);
+      --accent: #10b981;
+      --accent-hover: #059669;
+      --blue: #3b82f6;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: rgba(19, 26, 42, 0.92);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      backdrop-filter: blur(12px);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-badge {
+      background: linear-gradient(135deg, #10b981, #059669);
+      color: #fff;
+      font-weight: 800;
+      padding: 6px 11px;
+      border-radius: 8px;
+      font-size: 14px;
+      letter-spacing: 0.5px;
+    }
+    .brand h1 {
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .brand p {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .status-pills {
+      display: flex;
+      gap: 10px;
+      font-size: 12px;
+    }
+    .pill {
+      padding: 5px 11px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .pill.ok {
+      color: #34d399;
+      border-color: rgba(16, 185, 129, 0.35);
+      background: rgba(16, 185, 129, 0.1);
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: 430px 1fr;
+      gap: 20px;
+      padding: 20px 24px;
+      max-width: 1680px;
+      width: 100%;
+      margin: 0 auto;
+      flex: 1;
+    }
+    @media (max-width: 1100px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+    }
+
+    label {
+      display: block;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #cbd5e1;
+      margin-bottom: 5px;
+    }
+    .hint {
+      font-size: 11.5px;
+      color: var(--muted);
+      margin-top: 4px;
+      line-height: 1.4;
+    }
+    input[type="text"], select {
+      width: 100%;
+      padding: 9px 11px;
+      background: #0d1322;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+    }
+    input[type="text"]:focus, select:focus {
+      border-color: var(--accent);
+    }
+    .input-row {
+      display: flex;
+      gap: 8px;
+    }
+    .btn {
+      padding: 9px 14px;
+      border-radius: 8px;
+      border: 1px solid transparent;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #052e16;
+      font-weight: 700;
+      padding: 11px 16px;
+      font-size: 14px;
+    }
+    .btn-primary:hover { background: #34d399; }
+    .btn-secondary {
+      background: var(--panel-2);
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn-secondary:hover { background: #24304d; }
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.15);
+      color: #fca5a5;
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+    .btn-danger:hover { background: rgba(239, 68, 68, 0.28); }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .mode-selector {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .mode-option {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: #0d1322;
+      border: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .mode-option.active {
+      border-color: var(--accent);
+      background: rgba(16, 185, 129, 0.08);
+    }
+    .mode-option input { margin-top: 3px; }
+    .mode-option-title { font-size: 13px; font-weight: 700; color: #f8fafc; }
+    .mode-option-desc { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+    /* Right column layout */
+    .right-col {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .player-wrapper {
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      position: relative;
+      aspect-ratio: 16 / 9;
+      max-height: 540px;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      background: #000;
+    }
+    .player-empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 30px;
+    }
+    .player-empty h3 {
+      color: var(--text);
+      margin-bottom: 6px;
+      font-size: 16px;
+    }
+
+    .job-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .job-item {
+      background: #0d1322;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .job-item.active-watch {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.3);
+    }
+    .job-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .job-title {
+      font-weight: 700;
+      font-size: 14px;
+      color: #f8fafc;
+    }
+    .job-badge {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+      text-transform: uppercase;
+    }
+    .job-badge.running { background: rgba(59, 130, 246, 0.2); color: #93c5fd; }
+    .job-badge.completed { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; }
+    .job-badge.error, .job-badge.interrupted { background: rgba(245, 158, 11, 0.2); color: #fcd34d; }
+
+    .progress-bar-bg {
+      width: 100%;
+      height: 7px;
+      background: #1e293b;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #10b981, #3b82f6);
+      transition: width 0.3s ease;
+    }
+    .job-msg {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .job-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 2px;
+    }
+
+    .cues-table-wrap {
+      max-height: 270px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0d1322;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12.5px;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      text-align: left;
+    }
+    th {
+      background: #161f33;
+      color: #cbd5e1;
+      position: sticky;
+      top: 0;
+    }
+    tr.cue-row { cursor: pointer; }
+    tr.cue-row:hover { background: rgba(16, 185, 129, 0.12); }
+    tr.cue-row.speaking { background: rgba(16, 185, 129, 0.22); font-weight: 600; }
+    .time-cell {
+      font-family: Consolas, monospace;
+      color: #34d399;
+      white-space: nowrap;
+      width: 110px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="brand-badge">STUDIO v6</span>
+      <div>
+        <h1>Movie Voice Studio & Web Cinema Player</h1>
+        <p>Xử lý thuyết minh trước toàn tập • Khớp 100% chữ phụ đề trên video • Tua bất kỳ đâu 0ms delay</p>
+      </div>
+    </div>
+    <div class="status-pills">
+      <span id="pillGroq" class="pill">Groq API: ...</span>
+      <span id="pillGemini" class="pill">Gemini Vision OCR: ...</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- CỘT TRÁI: TẠO JOB XỬ LÝ PHIM -->
+    <div class="card">
+      <div class="card-title">
+        <span>🎬 1. Tạo Tiến Trình Thuyết Minh Phim</span>
+      </div>
+
+      <div>
+        <label>Tên bộ phim / Tập phim</label>
+        <input type="text" id="inpTitle" placeholder="Ví dụ: Avengers: Hồi Kết (Tập Full)" value="Avengers: Hồi Kết" />
+      </div>
+
+      <div>
+        <label>📁 Chọn File Video trên máy (.mp4, .mkv, .webm)</label>
+        <div class="input-row">
+          <input type="text" id="inpVideoPath" placeholder="C:\Downloads\ten_phim.mp4" />
+          <button class="btn btn-secondary" onclick="pickLocalFile('video')">📂 Chọn File...</button>
+        </div>
+        <div class="hint">Chọn trực tiếp file phim đã tải về máy (không tốn thời gian upload).</div>
+      </div>
+
+      <div>
+        <label>🔗 Hoặc dán Link Stream (.m3u8 / .mp4 trực tiếp)</label>
+        <input type="text" id="inpStreamUrl" placeholder="https://.../index.m3u8 (Để trống nếu đã chọn file trên máy)" />
+      </div>
+
+      <div>
+        <label>🎯 Chế độ lấy lời thoại & Khớp phụ đề</label>
+        <div class="mode-selector">
+          <label class="mode-option active" id="optHardsub" onclick="selectMode('hardsub')">
+            <input type="radio" name="dubMode" value="hardsub" checked />
+            <div>
+              <div class="mode-option-title">🎯 Khớp 100% Phụ Đề Trên Hình (Hard-Sub Vietsub)</div>
+              <div class="mode-option-desc">Quét vùng phụ đề đáy video bằng OpenCV + Vision OCR, đọc đúng 100% từng chữ tiếng Việt in trên hình và khớp đúng mili-giây chữ xuất hiện.</div>
+            </div>
+          </label>
+          <label class="mode-option" id="optSrt" onclick="selectMode('srt')">
+            <input type="radio" name="dubMode" value="srt" />
+            <div>
+              <div class="mode-option-title">📄 Dùng File Phụ Đề Rời (.srt / .vtt)</div>
+              <div class="mode-option-desc">Nhanh nhất (chỉ 1–2 phút): đọc trực tiếp file .srt/.vtt tiếng Việt hoặc tự dịch từ .srt tiếng Anh.</div>
+            </div>
+          </label>
+          <label class="mode-option" id="optAsr" onclick="selectMode('asr')">
+            <input type="radio" name="dubMode" value="asr" />
+            <div>
+              <div class="mode-option-title">🎙️ Nghe Âm Thanh Gốc & Dịch (Phim Raw không sub)</div>
+              <div class="mode-option-desc">Dùng Groq Whisper tách lời thoại tiếng Anh rồi dịch sang tiếng Việt theo ngữ cảnh phim.</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div id="srtInputBox" style="display:none;">
+        <label>📄 Đường dẫn File Phụ Đề (.srt / .vtt)</label>
+        <div class="input-row">
+          <input type="text" id="inpSubPath" placeholder="C:\Downloads\phude.srt" />
+          <button class="btn btn-secondary" onclick="pickLocalFile('subtitle')">📂 Chọn Sub...</button>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div>
+          <label>⏱️ Từ mốc (Tùy chọn)</label>
+          <input type="text" id="inpStartTime" placeholder="VD: 12:00 (Trống = Từ đầu)" />
+        </div>
+        <div>
+          <label>⏱️ Đến mốc (Tùy chọn)</label>
+          <input type="text" id="inpEndTime" placeholder="VD: 15:00 (Trống = Hết phim)" />
+        </div>
+      </div>
+      <div class="hint" style="margin-top:-8px;">Mẹo: Bạn có thể nhập thử <b>12:00</b> đến <b>14:00</b> để test nhanh 2 phút phim trong 35 giây!</div>
+
+      <div class="grid-2">
+        <div>
+          <label>🎙️ Giọng thuyết minh</label>
+          <select id="selVoice">
+            <option value="vi-VN-HoaiMyNeural">Nữ — Hoài My (Truyền cảm)</option>
+            <option value="vi-VN-NamMinhNeural">Nam — Nam Minh (Trầm ấm)</option>
+          </select>
+        </div>
+        <div>
+          <label>🔉 Âm lượng nhạc nền phim gốc</label>
+          <select id="selDuck">
+            <option value="0.22" selected>22% khi có thoại (Chuẩn rạp)</option>
+            <option value="0.15">15% khi có thoại (Rõ giọng đọc)</option>
+            <option value="0.32">32% khi có thoại (Giữ hiệu ứng mạnh)</option>
+          </select>
+        </div>
+      </div>
+
+      <button class="btn btn-primary" id="btnStartJob" onclick="startStudioJob()">
+        🚀 Bắt Đầu Xử Lý Thuyết Minh
+      </button>
+    </div>
+
+    <!-- CỘT PHẢI: TRÌNH PHÁT CINEMA & DANH SÁCH TIẾN TRÌNH -->
+    <div class="right-col">
+      <div class="card">
+        <div class="card-title">
+          <span id="playerHeaderTitle">🍿 2. Rạp Chiếu Web Cinema (Tua mượt 0ms • Hỗ trợ Google Meet)</span>
+          <span style="font-size:12px; color:var(--muted);">Share Tab này trên Google Meet để xem chung</span>
+        </div>
+
+        <div class="player-wrapper">
+          <video id="cinemaVideo" controls preload="metadata" style="display:none;">
+            <track id="cinemaTrack" kind="subtitles" srclang="vi" label="Tiếng Việt" default />
+          </video>
+          <div id="playerEmptyState" class="player-empty">
+            <h3>Chưa mở video nào</h3>
+            <p>Hãy tạo một tiến trình xử lý ở cột bên trái, sau đó bấm <b>"▶️ Xem Ngay"</b> khi hoàn tất.<br/>Video đã xử lý có âm thanh thuyết minh gắn cứng nên bạn tua tới bất kỳ giây nào cũng khớp 100%!</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>📋 3. Danh Sách Phim & Tiến Trình Xử Lý</span>
+          <button class="btn btn-secondary" style="padding:5px 10px; font-size:12px;" onclick="refreshJobs()">🔄 Làm mới</button>
+        </div>
+        <div id="jobListContainer" class="job-list">
+          <div class="hint">Chưa có tiến trình nào.</div>
+        </div>
+      </div>
+
+      <div class="card" id="cuesCard" style="display:none;">
+        <div class="card-title">
+          <span id="cuesCardTitle">📝 Bảng Câu Phụ Đề Đã Quét Từ Video (Bấm vào câu để tua tới đúng giây đó)</span>
+        </div>
+        <div class="cues-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Thời gian</th>
+                <th>Nội dung Thuyết minh (Khớp phụ đề trên hình)</th>
+              </tr>
+            </thead>
+            <tbody id="cuesTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    let currentWatchJobId = null;
+    let currentCues = [];
+
+    function formatMMSS(sec) {
+      const s = Math.max(0, Math.floor(sec || 0));
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const rem = s % 60;
+      if (h > 0) return `${h}:${m < 10 ? '0' : ''}${m}:${rem < 10 ? '0' : ''}${rem}`;
+      return `${m < 10 ? '0' : ''}${m}:${rem < 10 ? '0' : ''}${rem}`;
+    }
+
+    function selectMode(mode) {
+      document.querySelectorAll('.mode-option').forEach(el => el.classList.remove('active'));
+      if (mode === 'hardsub') document.getElementById('optHardsub').classList.add('active');
+      if (mode === 'srt') document.getElementById('optSrt').classList.add('active');
+      if (mode === 'asr') document.getElementById('optAsr').classList.add('active');
+      document.querySelector(`input[name="dubMode"][value="${mode}"]`).checked = true;
+      document.getElementById('srtInputBox').style.display = (mode === 'srt') ? 'block' : 'none';
+    }
+
+    async function checkHealth() {
+      try {
+        const r = await fetch('/api/health');
+        const d = await r.json();
+        const pg = document.getElementById('pillGroq');
+        const pm = document.getElementById('pillGemini');
+        pg.textContent = d.groq_configured ? 'Groq API: Sẵn sàng' : 'Groq API: Chưa cấu hình';
+        pg.className = 'pill ' + (d.groq_configured ? 'ok' : '');
+        pm.textContent = d.gemini_configured ? 'Gemini Vision OCR: Sẵn sàng' : 'Gemini Vision OCR: Chưa cấu hình';
+        pm.className = 'pill ' + (d.gemini_configured ? 'ok' : '');
+      } catch (e) {}
+    }
+
+    async function pickLocalFile(kind) {
+      try {
+        const r = await fetch(`/api/studio/pick-file?kind=${kind}`);
+        const d = await r.json();
+        if (d.path) {
+          if (kind === 'video') {
+            document.getElementById('inpVideoPath').value = d.path;
+            const fname = d.path.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
+            if (!document.getElementById('inpTitle').value) {
+              document.getElementById('inpTitle').value = fname;
+            }
+          } else {
+            document.getElementById('inpSubPath').value = d.path;
+          }
+        }
+      } catch (e) {
+        alert('Không thể mở hộp thoại chọn file: ' + e);
+      }
+    }
+
+    async function startStudioJob() {
+      const mode = document.querySelector('input[name="dubMode"]:checked').value;
+      const payload = {
+        title: document.getElementById('inpTitle').value.trim() || 'Phim Thuyết Minh',
+        mode,
+        video_path: document.getElementById('inpVideoPath').value.trim(),
+        stream_url: document.getElementById('inpStreamUrl').value.trim(),
+        subtitle_path: document.getElementById('inpSubPath').value.trim(),
+        start_time_str: document.getElementById('inpStartTime').value.trim(),
+        end_time_str: document.getElementById('inpEndTime').value.trim(),
+        voice: document.getElementById('selVoice').value,
+        duck_level: parseFloat(document.getElementById('selDuck').value)
+      };
+
+      if (!payload.video_path && !payload.stream_url) {
+        alert('Vui lòng chọn file video trên máy hoặc dán link stream (.m3u8 / .mp4)!');
+        return;
+      }
+
+      const btn = document.getElementById('btnStartJob');
+      btn.disabled = true;
+      btn.textContent = '⏳ Đang khởi tạo...';
+      try {
+        const r = await fetch('/api/studio/jobs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || 'Lỗi tạo tiến trình');
+        await refreshJobs();
+      } catch (e) {
+        alert('Lỗi: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🚀 Bắt Đầu Xử Lý Thuyết Minh';
+      }
+    }
+
+    async function refreshJobs() {
+      try {
+        const r = await fetch('/api/studio/jobs');
+        const d = await r.json();
+        const jobs = d.jobs || [];
+        const container = document.getElementById('jobListContainer');
+        if (jobs.length === 0) {
+          container.innerHTML = '<div class="hint">Chưa có tiến trình nào. Hãy chọn file phim ở cột bên trái và bấm Bắt Đầu.</div>';
+          return;
+        }
+
+        container.innerHTML = jobs.map(j => {
+          const isCompleted = j.status === 'completed';
+          const isRunning = j.status === 'running';
+          const canResume = j.status === 'error' || j.status === 'interrupted';
+          const rangeTxt = (j.start_sec > 0 || j.end_sec > 0)
+            ? ` • Đoạn ${formatMMSS(j.start_sec)}..${j.end_sec > 0 ? formatMMSS(j.end_sec) : 'hết'}`
+            : '';
+          return `
+            <div class="job-item ${currentWatchJobId === j.id ? 'active-watch' : ''}">
+              <div class="job-header">
+                <div class="job-title">${j.title} <span style="font-weight:400; font-size:12px; color:var(--muted);">(${j.mode.toUpperCase()}${rangeTxt})</span></div>
+                <span class="job-badge ${j.status}">${j.status === 'completed' ? 'Hoàn tất' : (j.status === 'running' ? j.progress + '%' : j.status)}</span>
+              </div>
+              <div class="progress-bar-bg">
+                <div class="progress-bar-fill" style="width:${Math.min(100, Math.max(2, j.progress || 0))}%"></div>
+              </div>
+              <div class="job-msg">${j.message || ''}</div>
+              <div class="job-actions">
+                ${isCompleted ? `<button class="btn btn-primary" style="padding:6px 12px; font-size:12.5px;" onclick="watchJob('${j.id}', '${j.title.replace(/'/g, "\\'")}')">▶️ Mở Xem Ngay (${j.cues_count} câu)</button>` : ''}
+                ${isCompleted ? `<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px;" onclick="openJobFolder('${j.id}')">📂 Mở File MP4</button>` : ''}
+                ${j.cues_count > 0 ? `<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px;" onclick="loadJobCues('${j.id}', '${j.title.replace(/'/g, "\\'")}')">📝 Xem ${j.cues_count} câu phụ đề</button>` : ''}
+                ${canResume ? `<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px;" onclick="resumeJob('${j.id}')">▶️ Chạy tiếp từ Checkpoint</button>` : ''}
+                <button class="btn btn-danger" style="padding:6px 10px; font-size:12px;" onclick="deleteJob('${j.id}')">🗑️ Xóa</button>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } catch (e) {}
+    }
+
+    async function watchJob(jobId, title) {
+      currentWatchJobId = jobId;
+      const video = document.getElementById('cinemaVideo');
+      const track = document.getElementById('cinemaTrack');
+      const empty = document.getElementById('playerEmptyState');
+      document.getElementById('playerHeaderTitle').textContent = `🍿 Đang phát: ${title} (Đã ghép sẵn Thuyết Minh Tiếng Việt)`;
+
+      empty.style.display = 'none';
+      video.style.display = 'block';
+      video.src = `/api/studio/jobs/${jobId}/video?t=${Date.now()}`;
+      track.src = `/api/studio/jobs/${jobId}/vtt?t=${Date.now()}`;
+      video.load();
+      video.play().catch(() => {});
+
+      await loadJobCues(jobId, title);
+      await refreshJobs();
+    }
+
+    async function loadJobCues(jobId, title) {
+      try {
+        const r = await fetch(`/api/studio/jobs/${jobId}/cues`);
+        const d = await r.json();
+        currentCues = d.cues || [];
+        const card = document.getElementById('cuesCard');
+        const tbody = document.getElementById('cuesTableBody');
+        document.getElementById('cuesCardTitle').textContent = `📝 Bảng Phụ Đề Đã Quét (${currentCues.length} câu — ${title})`;
+        card.style.display = 'flex';
+        tbody.innerHTML = currentCues.map((c, idx) => `
+          <tr class="cue-row" id="cue-row-${idx}" onclick="seekCinemaTo(${c.start})">
+            <td class="time-cell">${formatMMSS(c.start)} → ${formatMMSS(c.end)}</td>
+            <td>${c.text}</td>
+          </tr>
+        `).join('');
+      } catch (e) {}
+    }
+
+    function seekCinemaTo(sec) {
+      const video = document.getElementById('cinemaVideo');
+      if (video && video.style.display !== 'none') {
+        video.currentTime = Math.max(0, sec - 0.1);
+        video.play().catch(() => {});
+      }
+    }
+
+    async function openJobFolder(jobId) {
+      await fetch(`/api/studio/open-folder/${jobId}`, { method: 'POST' });
+    }
+
+    async function resumeJob(jobId) {
+      await fetch(`/api/studio/jobs/${jobId}/resume`, { method: 'POST' });
+      await refreshJobs();
+    }
+
+    async function deleteJob(jobId) {
+      if (!confirm('Xóa tiến trình này?')) return;
+      await fetch(`/api/studio/jobs/${jobId}`, { method: 'DELETE' });
+      if (currentWatchJobId === jobId) {
+        const video = document.getElementById('cinemaVideo');
+        video.pause();
+        video.style.display = 'none';
+        document.getElementById('playerEmptyState').style.display = 'block';
+        document.getElementById('cuesCard').style.display = 'none';
+        currentWatchJobId = null;
+      }
+      await refreshJobs();
+    }
+
+    // Highlight active cue row while video plays
+    document.getElementById('cinemaVideo').addEventListener('timeupdate', (e) => {
+      const t = e.target.currentTime;
+      for (let i = 0; i < currentCues.length; i++) {
+        const row = document.getElementById(`cue-row-${i}`);
+        if (!row) continue;
+        const c = currentCues[i];
+        if (t >= c.start - 0.15 && t <= c.end + 0.3) {
+          row.classList.add('speaking');
+        } else {
+          row.classList.remove('speaking');
+        }
+      }
+    });
+
+    // Check URL params if launched from Chrome Extension with stream_url & title
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('stream_url')) {
+      document.getElementById('inpStreamUrl').value = params.get('stream_url');
+    }
+    if (params.get('title')) {
+      document.getElementById('inpTitle').value = params.get('title');
+    }
+
+    checkHealth();
+    refreshJobs();
+    setInterval(refreshJobs, 2000);
+  </script>
+</body>
+</html>

@@ -12,15 +12,19 @@ ENV_FILE = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_FILE)
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
+import asyncio
+import json
+import subprocess
 
 from pipeline import DubbingPipeline
 from providers.tts_edge import CACHE_DIR
+from studio_pipeline import StudioManager, WORKSPACE_DIR
 
-app = FastAPI(title="Movie Voice Engine - AI Dubbing & Synchronization")
+app = FastAPI(title="Movie Voice Studio v6 - Offline & Real-Time Dubbing Engine")
 
 # Allow CORS for Chrome Extensions and local testing
 app.add_middleware(
@@ -32,6 +36,8 @@ app.add_middleware(
 )
 
 pipeline = DubbingPipeline()
+studio = StudioManager()
+STUDIO_UI_FILE = Path(__file__).resolve().parent / "studio_ui.html"
 RECENT_CLIENT_LOGS: List[str] = []
 
 
@@ -192,7 +198,140 @@ async def update_settings(req: SettingsUpdate):
     ]
     ENV_FILE.write_text("\n".join(lines), encoding="utf-8")
     pipeline.reload_config()
+    studio.reload_keys()
     return {"ok": True, "message": "Settings updated successfully"}
+
+
+class StudioJobCreate(BaseModel):
+    title: Optional[str] = "Phim Thuyết Minh"
+    mode: Optional[str] = "hardsub"
+    video_path: Optional[str] = ""
+    stream_url: Optional[str] = ""
+    subtitle_path: Optional[str] = ""
+    voice: Optional[str] = "vi-VN-HoaiMyNeural"
+    rate: Optional[int] = 0
+    duck_level: Optional[float] = 0.22
+    start_time_str: Optional[str] = ""
+    end_time_str: Optional[str] = ""
+    referer: Optional[str] = ""
+    user_agent: Optional[str] = ""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_studio_ui():
+    """Serves the Movie Voice Studio v6 & Web Cinema Player dashboard."""
+    if STUDIO_UI_FILE.exists():
+        return HTMLResponse(STUDIO_UI_FILE.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Movie Voice Studio v6</h1>")
+
+
+@app.get("/api/studio/pick-file")
+async def pick_local_file(kind: str = "video"):
+    """Opens native Windows OpenFileDialog so user can pick a local .mp4/.mkv or .srt/.vtt file."""
+    if kind == "subtitle":
+        flt = "Subtitle Files (*.srt;*.vtt)|*.srt;*.vtt|All Files (*.*)|*.*"
+        title = "Chọn File Phụ Đề (.srt / .vtt)"
+    else:
+        flt = "Video Files (*.mp4;*.mkv;*.webm;*.avi;*.ts)|*.mp4;*.mkv;*.webm;*.avi;*.ts|All Files (*.*)|*.*"
+        title = "Chọn File Phim Trên Máy (.mp4 / .mkv)"
+
+    ps_script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$f = New-Object System.Windows.Forms.OpenFileDialog; "
+        f"$f.Filter = '{flt}'; "
+        f"$f.Title = '{title}'; "
+        "$top = New-Object System.Windows.Forms.Form; $top.TopMost = $true; "
+        "if ($f.ShowDialog($top) -eq 'OK') { Write-Output $f.FileName }"
+    )
+    res = await asyncio.to_thread(
+        subprocess.run,
+        ["powershell", "-NoProfile", "-Command", ps_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    chosen = (res.stdout or "").strip()
+    return {"path": chosen}
+
+
+@app.get("/api/studio/jobs")
+async def list_studio_jobs():
+    return {"jobs": studio.list_jobs()}
+
+
+@app.post("/api/studio/jobs")
+async def create_studio_job(req: StudioJobCreate):
+    try:
+        job = studio.create_and_start_job(
+            title=req.title or "Phim Thuyết Minh",
+            mode=req.mode or "hardsub",
+            video_path=req.video_path or "",
+            stream_url=req.stream_url or "",
+            subtitle_path=req.subtitle_path or "",
+            voice=req.voice or "vi-VN-HoaiMyNeural",
+            rate=req.rate or 0,
+            duck_level=req.duck_level if req.duck_level is not None else 0.22,
+            start_time_str=req.start_time_str or "",
+            end_time_str=req.end_time_str or "",
+            referer=req.referer or "",
+            user_agent=req.user_agent or "",
+        )
+        return {"ok": True, "job": job}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/studio/jobs/{job_id}/resume")
+async def resume_studio_job(job_id: str):
+    job = studio.resume_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"ok": True, "job": job}
+
+
+@app.delete("/api/studio/jobs/{job_id}")
+async def delete_studio_job(job_id: str):
+    studio.delete_job(job_id)
+    return {"ok": True}
+
+
+@app.get("/api/studio/jobs/{job_id}/cues")
+async def get_studio_job_cues(job_id: str):
+    cues_file = WORKSPACE_DIR / job_id / "cues.json"
+    if cues_file.exists():
+        cues = json.loads(cues_file.read_text(encoding="utf-8"))
+        return {"cues": cues}
+    job = studio.get_job(job_id)
+    return {"cues": job.get("cues_preview", []) if job else []}
+
+
+@app.get("/api/studio/jobs/{job_id}/vtt")
+async def get_studio_job_vtt(job_id: str):
+    vtt_file = WORKSPACE_DIR / job_id / "vi.vtt"
+    if not vtt_file.exists():
+        raise HTTPException(status_code=404, detail="VTT not ready")
+    return FileResponse(vtt_file, media_type="text/vtt")
+
+
+@app.get("/api/studio/jobs/{job_id}/video")
+async def get_studio_job_video(job_id: str):
+    """Streams the dubbed MP4 video with full HTTP 206 Range request support for instant seeking."""
+    mp4_file = WORKSPACE_DIR / job_id / "output_thuyetminh.mp4"
+    if not mp4_file.exists():
+        raise HTTPException(status_code=404, detail="Dubbed video not ready")
+    return FileResponse(mp4_file, media_type="video/mp4")
+
+
+@app.post("/api/studio/open-folder/{job_id}")
+async def open_studio_job_folder(job_id: str):
+    mp4_file = WORKSPACE_DIR / job_id / "output_thuyetminh.mp4"
+    if mp4_file.exists():
+        subprocess.Popen(["explorer.exe", f"/select,{str(mp4_file)}"])
+    else:
+        job_dir = WORKSPACE_DIR / job_id
+        if job_dir.exists():
+            subprocess.Popen(["explorer.exe", str(job_dir)])
+    return {"ok": True}
 
 
 if __name__ == "__main__":

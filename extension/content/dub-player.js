@@ -630,8 +630,15 @@
 
   setInterval(pumpSoftSubtitleFile, 1000);
 
+  let detectedStreamUrl = "";
+
   window.addEventListener("message", (event) => {
     if (!event.data) return;
+
+    if (event.data.type === "__MOVIE_VOICE_STREAM_URL__" && event.data.url) {
+      detectedStreamUrl = event.data.url;
+      return;
+    }
 
     if (event.data.type === "__MOVIE_VOICE_SUBTITLE_FILE__" && Array.isArray(event.data.cues)) {
       hasSoftSubtitles = true;
@@ -727,6 +734,7 @@
     uiContainer.className = "movie-voice-floating-bar";
     uiContainer.innerHTML = `
       <button class="mv-toggle-btn ${config.enabled ? 'active' : ''}">🇻🇳 VI · Thuyết minh: BẬT</button>
+      <button class="mv-studio-btn" title="Mở Movie Voice Studio v6 (Tải & xử lý trước toàn tập khớp 100% sub trên hình)" style="background:#3b82f6;color:#fff;border:none;border-radius:999px;padding:4px 10px;font-size:11.5px;font-weight:700;cursor:pointer;">🎬 Studio</button>
       <span class="mv-status-text">Sẵn sàng</span>
     `;
 
@@ -741,6 +749,14 @@
         chrome.storage.sync.set({ enabled: config.enabled });
       }
       updateUI();
+    });
+
+    uiContainer.querySelector(".mv-studio-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (activeVideo) activeVideo.pause();
+      const title = encodeURIComponent(extractMovieTitle() || "Phim Thuyết Minh");
+      const stream = encodeURIComponent(detectedStreamUrl || "");
+      window.open(`${ENGINE_URL}/?title=${title}&stream_url=${stream}`, "_blank");
     });
 
     statusTextEl = uiContainer.querySelector(".mv-status-text");
