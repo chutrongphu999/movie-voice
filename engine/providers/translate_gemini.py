@@ -154,7 +154,7 @@ class Translator:
         should_run = (
             force
             or (not self.bible and (total >= 3 or bool(self.movie_title)))
-            or (total - self._last_bible_line_count >= 18)
+            or (total <= 60 and total - self._last_bible_line_count >= 25)
         )
         if should_run:
             self._last_bible_line_count = total
@@ -181,7 +181,7 @@ class Translator:
                         raw_resp = await self._call_groq_messages(
                             [{"role": "system", "content": UNDERSTAND_SYSTEM}, {"role": "user", "content": user_msg}],
                             model_name=m,
-                            max_tokens=2500,
+                            max_tokens=1800,
                             timeout=9.0
                         )
                         if raw_resp and "{" in raw_resp:
@@ -241,28 +241,31 @@ class Translator:
                     if txt:
                         results_map[idx] = clean_translated_line(txt)
 
-        if not results_map:
-            raise RuntimeError("No valid translated items parsed from LLM response")
+        if len(results_map) < expected_count:
+            raise RuntimeError(f"Incomplete LLM translation ({len(results_map)}/{expected_count} items)")
 
-        return [results_map.get(i, clean_translated_line(fallback_lines[i])) for i in range(expected_count)]
+        return [results_map[i] for i in range(expected_count)]
 
     async def _call_groq_messages(
         self,
         messages: List[Dict[str, str]],
         model_name: str,
-        max_tokens: int = 1500,
+        max_tokens: int = 900,
         timeout: float = 5.5
     ) -> str:
         if not self.groq_client:
             raise RuntimeError("No Groq client configured")
 
         def _call():
-            chat = self.groq_client.chat.completions.create(
-                messages=messages,
-                model=model_name,
-                temperature=0.15,
-                max_tokens=max_tokens
-            )
+            kwargs: Dict[str, Any] = {
+                "messages": messages,
+                "model": model_name,
+                "temperature": 0.15,
+                "max_tokens": max_tokens,
+            }
+            if "gpt-oss" in model_name:
+                kwargs["reasoning_effort"] = "low"
+            chat = self.groq_client.chat.completions.create(**kwargs)
             return chat.choices[0].message.content or ""
 
         return await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout)
